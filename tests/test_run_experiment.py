@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
+from config_loader import load_yaml_config  # noqa: E402
 from generation.tabdiff import require_tabdiff_repo, train_command  # noqa: E402
 from pipeline import load_config_overrides  # noqa: E402
 from protocol import (  # noqa: E402
@@ -23,23 +24,32 @@ from protocol import (  # noqa: E402
     DEFAULT_SPLIT_SEED,
     MR_LORA_ARG_SPECS,
 )
-from protocol_integrity import file_sha256  # noqa: E402
+from protocol_integrity import canonical_sha256, file_sha256  # noqa: E402
 from run_experiment import (  # noqa: E402
     MAIN_TRAIN_ARG_SPECS,
+    bind_metrics_to_effective_protocol,
     build_main_train_command,
     build_parser,
     build_tabdiff_generation_command,
+    effective_protocol_sha256,
+    effective_protocol_snapshot,
     load_seed_metrics,
     metrics_integrity_fields,
     metrics_output_snapshot,
     require_file_sha256,
     require_fresh_seed_metrics,
     require_loaded_config_sha256,
+    scientific_producer_protocol_sha256,
+    scientific_producer_protocol_snapshot,
     validate_args,
     validate_declared_protocol,
     validate_runner_integrity,
     write_runner_summary,
 )
+
+TEST_EFFECTIVE_PROTOCOL = {"format": "test_effective_protocol", "locked": True}
+TEST_EFFECTIVE_PROTOCOL_SHA256 = canonical_sha256(TEST_EFFECTIVE_PROTOCOL)
+TEST_PRODUCER_PROTOCOL_SHA256 = "6" * 64
 
 TEST_INTEGRITY_FIELDS = {
     "Split_Seed": 42,
@@ -49,22 +59,29 @@ TEST_INTEGRITY_FIELDS = {
     "Synthetic_SHA256": "3" * 64,
     "Generation_Seed": 0,
     "Config_SHA256": "4" * 64,
+    "Effective_Protocol_SHA256": TEST_EFFECTIVE_PROTOCOL_SHA256,
+    "CBTG_Cross_Run_Validation_STD_SHA256": "5" * 64,
+    "Synthetic_Provenance_SHA256": "7" * 64,
 }
 
 
 def _with_integrity(metrics: dict[str, object]) -> dict[str, object]:
-    return {**metrics, **TEST_INTEGRITY_FIELDS}
+    return {"TAIL_MAE": 2.5, **metrics, **TEST_INTEGRITY_FIELDS}
+
+
+def _summary_protocol_kwargs() -> dict[str, object]:
+    return {
+        "effective_protocol": TEST_EFFECTIVE_PROTOCOL,
+        "effective_protocol_hash": TEST_EFFECTIVE_PROTOCOL_SHA256,
+    }
 
 
 class RunMainExperimentTest(unittest.TestCase):
     def test_yaml_protocol_must_match_locked_runner(self) -> None:
-        valid = {
-            "model_seeds": DEFAULT_SEEDS,
-            "split_seed": DEFAULT_SPLIT_SEED,
-            "split_method": DEFAULT_SPLIT_METHOD,
-            "generation_seed": DEFAULT_GENERATION_SEED,
-        }
+        valid = load_yaml_config(PROJECT_ROOT / "configs" / "mtam_hg.yaml")
         validate_declared_protocol(valid)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            validate_declared_protocol({**valid, "dropout": 0.3})
         with self.assertRaisesRegex(ValueError, "does not match"):
             validate_declared_protocol({**valid, "model_seeds": DEFAULT_SEEDS[:-1]})
 
@@ -81,6 +98,151 @@ class RunMainExperimentTest(unittest.TestCase):
             path.write_text("split_seed: 43\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "changed during"):
                 require_file_sha256(path, expected, "Experiment config")
+
+    def test_effective_protocol_hash_covers_yaml_runner_runtime_and_cross_run_artifact(self) -> None:
+        args = build_parser().parse_args([])
+        cross_run = {
+            "sha256": "5" * 64,
+            "payload": {"source": "independent_validation_runs", "num_runs": 10},
+        }
+        first = effective_protocol_snapshot({"b": 2, "a": 1}, args, 5000, cross_run)
+        reordered = effective_protocol_snapshot({"a": 1, "b": 2}, args, 5000, cross_run)
+
+        self.assertEqual(effective_protocol_sha256(first), effective_protocol_sha256(reordered))
+        changed_args = build_parser().parse_args(["--output_root", "outputs/alternate"])
+        changed = effective_protocol_snapshot({"a": 1, "b": 2}, changed_args, 5000, cross_run)
+        self.assertNotEqual(effective_protocol_sha256(first), effective_protocol_sha256(changed))
+
+    def test_producer_protocol_excludes_operations_but_covers_scientific_runtime(self) -> None:
+        base_args = build_parser().parse_args([])
+        moved_args = build_parser().parse_args(
+            [
+                "--output_root",
+                "outputs/alternate",
+                "--cbtg_cross_run_validation_std_path",
+                "data/alternate.json",
+                "--tabdiff_gpu",
+                "1",
+            ]
+        )
+        config_values = {
+            "epochs": 50,
+            "output_base": "outputs/mtam_hg",
+            "cbtg_cross_run_validation_std_path": "data/reference.json",
+        }
+        runtime = {"LR": 1.0e-3, "OUTPUT_DIR": "outputs/one"}
+        first = scientific_producer_protocol_snapshot(
+            config_values,
+            base_args,
+            5000,
+            runtime,
+            "a" * 64,
+        )
+        moved = scientific_producer_protocol_snapshot(
+            {**config_values, "output_base": "outputs/two"},
+            moved_args,
+            5000,
+            {"LR": 1.0e-3, "OUTPUT_DIR": "outputs/two"},
+            "a" * 64,
+        )
+        changed = scientific_producer_protocol_snapshot(
+            config_values,
+            base_args,
+            5000,
+            {"LR": 5.0e-4, "OUTPUT_DIR": "outputs/one"},
+            "a" * 64,
+        )
+
+        self.assertEqual(
+            scientific_producer_protocol_sha256(first),
+            scientific_producer_protocol_sha256(moved),
+        )
+        self.assertNotEqual(
+            scientific_producer_protocol_sha256(first),
+            scientific_producer_protocol_sha256(changed),
+        )
+        alternate_seeds = build_parser().parse_args(
+            ["--seeds", *[str(seed) for seed in range(100, 110)]]
+        )
+        seed_independent = scientific_producer_protocol_snapshot(
+            {**config_values, "model_seeds": list(range(100, 110))},
+            alternate_seeds,
+            5000,
+            runtime,
+            "a" * 64,
+        )
+        self.assertEqual(
+            scientific_producer_protocol_sha256(first),
+            scientific_producer_protocol_sha256(seed_independent),
+        )
+
+    def test_metrics_are_bound_to_effective_protocol_before_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics_path = Path(tmp) / "metrics.json"
+            base_integrity = {
+                key: value
+                for key, value in TEST_INTEGRITY_FIELDS.items()
+                if key != "Effective_Protocol_SHA256"
+            }
+            metrics_path.write_text(
+                json.dumps(
+                    {
+                        "RMSE": 1.0,
+                        "MAE": 0.8,
+                        "MAPE": 3.4,
+                        "R2": 0.9,
+                        "TAIL_MAE": 2.5,
+                        "Model": "mtam_hg",
+                        "Experiment_Group": "mtam_hg_paper",
+                        "Seed": 42,
+                        **base_integrity,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            bound_hash = bind_metrics_to_effective_protocol(
+                metrics_path,
+                42,
+                TEST_INTEGRITY_FIELDS,
+            )
+            payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+            current_hash = file_sha256(metrics_path)
+
+        self.assertEqual(bound_hash, current_hash)
+        self.assertEqual(payload["Effective_Protocol_SHA256"], TEST_EFFECTIVE_PROTOCOL_SHA256)
+        self.assertEqual(payload["Synthetic_Provenance_SHA256"], "7" * 64)
+        self.assertEqual(payload["CBTG_Cross_Run_Validation_STD_SHA256"], "5" * 64)
+
+    def test_parent_rejects_metrics_without_child_provenance_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics_path = Path(tmp) / "metrics.json"
+            payload = _with_integrity({"Seed": 42})
+            payload.pop("Synthetic_Provenance_SHA256")
+            metrics_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Synthetic_Provenance_SHA256"):
+                bind_metrics_to_effective_protocol(metrics_path, 42, TEST_INTEGRITY_FIELDS)
+
+    def test_parent_rejects_metrics_without_child_cross_run_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics_path = Path(tmp) / "metrics.json"
+            payload = _with_integrity(
+                {
+                    "RMSE": 1.0,
+                    "MAE": 0.8,
+                    "MAPE": 3.4,
+                    "R2": 0.9,
+                    "Model": "mtam_hg",
+                    "Experiment_Group": "mtam_hg_paper",
+                    "Seed": 42,
+                }
+            )
+            payload.pop("Effective_Protocol_SHA256")
+            payload.pop("CBTG_Cross_Run_Validation_STD_SHA256")
+            metrics_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "CBTG_Cross_Run_Validation_STD_SHA256"):
+                bind_metrics_to_effective_protocol(metrics_path, 42, TEST_INTEGRITY_FIELDS)
 
     def test_parser_accepts_current_synthetic_agent_controls(self) -> None:
         args = build_parser().parse_args(
@@ -164,6 +326,11 @@ class RunMainExperimentTest(unittest.TestCase):
         self.assertEqual(defaults.generation_seed, DEFAULT_GENERATION_SEED)
         self.assertEqual(defaults.config, "configs/mtam_hg.yaml")
         self.assertEqual(defaults.synthetic_confidence_threshold, 0.5)
+        self.assertEqual(defaults.synthetic_agent_epochs, 100)
+        self.assertEqual(
+            defaults.cbtg_cross_run_validation_std_path,
+            "data/cbtg_cross_run_validation_std.json",
+        )
         self.assertTrue(defaults.use_dynamic_synthetic_agent)
         self.assertTrue(defaults.dynamic_synthetic_use_sampler)
         self.assertTrue(defaults.dynamic_synthetic_use_loss_weight)
@@ -179,7 +346,12 @@ class RunMainExperimentTest(unittest.TestCase):
     def test_tabdiff_generation_command_is_explicit_pipeline_phase(self) -> None:
         args = build_parser().parse_args(["--tabdiff_gpu", "0"])
 
-        cmd = build_tabdiff_generation_command(args, tabdiff_num_samples=5000)
+        cmd = build_tabdiff_generation_command(
+            args,
+            tabdiff_num_samples=5000,
+            scientific_code_hash="a" * 64,
+            generation_protocol_hash="b" * 64,
+        )
 
         self.assertIn("--mode", cmd)
         self.assertIn("generate_synthetic_tabdiff", cmd)
@@ -193,6 +365,8 @@ class RunMainExperimentTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--split_method") + 1], "stratified_random")
         self.assertEqual(cmd[cmd.index("--generation_seed") + 1], "0")
         self.assertEqual(cmd[cmd.index("--tabdiff_gpu") + 1], "0")
+        self.assertEqual(cmd[cmd.index("--scientific_code_sha256") + 1], "a" * 64)
+        self.assertEqual(cmd[cmd.index("--generation_protocol_sha256") + 1], "b" * 64)
 
     def test_main_command_covers_paper_aligned_mtam_hg_training_chain(self) -> None:
         args = build_parser().parse_args(["--synthetic_pretrain_confidence_threshold", "0.0"])
@@ -203,6 +377,8 @@ class RunMainExperimentTest(unittest.TestCase):
             run_dir=Path("outputs/mtam_hg/seed_42"),
             synthetic_path="data/synthetic_CAPL_ma_tabdiff.xlsx",
             tabdiff_num_samples=5000,
+            scientific_code_hash="a" * 64,
+            generation_protocol_hash="b" * 64,
         )
 
         self.assertIn("train_with_tabdiff_pretrain", main_cmd)
@@ -226,9 +402,15 @@ class RunMainExperimentTest(unittest.TestCase):
         self.assertEqual(main_cmd[main_cmd.index("--mr_lora_rank_graph") + 1], "8")
         self.assertEqual(main_cmd[main_cmd.index("--mr_lora_rank_routing") + 1], "4")
         self.assertIn("--use_cluster_balance_reward", main_cmd)
+        self.assertEqual(main_cmd[main_cmd.index("--synthetic_agent_epochs") + 1], "100")
+        self.assertEqual(
+            main_cmd[main_cmd.index("--cbtg_cross_run_validation_std_path") + 1],
+            "data/cbtg_cross_run_validation_std.json",
+        )
         self.assertNotIn("--skip_agent_filter", main_cmd)
+        self.assertEqual(main_cmd[main_cmd.index("--scientific_code_sha256") + 1], "a" * 64)
+        self.assertEqual(main_cmd[main_cmd.index("--generation_protocol_sha256") + 1], "b" * 64)
         self.assertNotIn("--no_synthetic_resampling", main_cmd)
-        self.assertNotIn("--synthetic_agent_epochs", main_cmd)
 
     def test_runner_summary_collects_final_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,6 +451,7 @@ class RunMainExperimentTest(unittest.TestCase):
                 seed_metrics_paths=seed_metrics_paths,
                 seed_metrics_sha256={seed: file_sha256(path) for seed, path in seed_metrics_paths.items()},
                 integrity_fields=TEST_INTEGRITY_FIELDS,
+                **_summary_protocol_kwargs(),
             )
 
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -280,11 +463,14 @@ class RunMainExperimentTest(unittest.TestCase):
         self.assertEqual(len(summary["seeds"]), 10)
         self.assertEqual(summary["seeds"][0]["metrics_seed"], 42)
         self.assertEqual(summary["aggregate_mean_std"]["RMSE"]["n"], 10)
+        self.assertEqual(summary["aggregate_mean_std"]["TAIL_MAE"]["n"], 10)
+        self.assertEqual(summary["effective_protocol_sha256"], TEST_EFFECTIVE_PROTOCOL_SHA256)
         self.assertEqual(summary["evaluation_protocol"], "confirmatory_fixed_seed")
         self.assertEqual(summary["model_seeds"], DEFAULT_SEEDS)
         self.assertEqual(summary["split_seed"], DEFAULT_SPLIT_SEED)
         self.assertEqual(summary["split_method"], DEFAULT_SPLIT_METHOD)
         self.assertEqual(summary["generation_seed"], DEFAULT_GENERATION_SEED)
+        self.assertTrue(summary["confirmatory_protocol"]["validated"])
         self.assertTrue(summary["confirmatory_protocol"]["shared_main_split"])
         self.assertEqual(summary["confirmatory_protocol"]["metrics_integrity"], TEST_INTEGRITY_FIELDS)
         self.assertIn("mechanism-aware TabDiff rows are used directly as the synthetic pretraining table", summary["pipeline"])
@@ -292,6 +478,20 @@ class RunMainExperimentTest(unittest.TestCase):
             "MoE-IPOHGN pretraining on synthetic samples with the K-means cluster-balanced CBTG-Agent policy",
             summary["pipeline"],
         )
+
+    def test_dry_run_summary_is_not_marked_as_validated_confirmatory_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            summary_path = write_runner_summary(
+                output_root,
+                phases=[],
+                seed_run_dirs={42: output_root / "seed_42"},
+                dry_run=True,
+            )
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["evaluation_protocol"], "confirmatory_dry_run")
+        self.assertFalse(summary["confirmatory_protocol"]["validated"])
 
     def test_load_seed_metrics_uses_current_main_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -348,7 +548,7 @@ class RunMainExperimentTest(unittest.TestCase):
                     expected_integrity=TEST_INTEGRITY_FIELDS,
                 )
 
-    def test_load_seed_metrics_requires_all_four_finite_primary_metrics(self) -> None:
+    def test_load_seed_metrics_requires_all_five_finite_paper_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "seed_42"
             results_dir = run_dir / "results"
@@ -371,6 +571,30 @@ class RunMainExperimentTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "finite metrics"):
                 load_seed_metrics(
                     results_dir / "metrics.json",
+                    expected_seed=42,
+                    expected_integrity=TEST_INTEGRITY_FIELDS,
+                )
+
+    def test_load_seed_metrics_rejects_missing_tail_mae(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics_path = Path(tmp) / "metrics.json"
+            payload = _with_integrity(
+                {
+                    "RMSE": 1.0,
+                    "MAE": 0.8,
+                    "MAPE": 3.4,
+                    "R2": 0.9,
+                    "Model": "mtam_hg",
+                    "Experiment_Group": "mtam_hg_paper",
+                    "Seed": 42,
+                }
+            )
+            payload.pop("TAIL_MAE")
+            metrics_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "TAIL_MAE"):
+                load_seed_metrics(
+                    metrics_path,
                     expected_seed=42,
                     expected_integrity=TEST_INTEGRITY_FIELDS,
                 )
@@ -420,6 +644,7 @@ class RunMainExperimentTest(unittest.TestCase):
                     "MAE": 0.8,
                     "MAPE": 3.4,
                     "R2": 0.9,
+                    "TAIL_MAE": 2.5,
                     "Model": "mtam_hg",
                     "Experiment_Group": "mtam_hg_paper",
                     "Seed": seed,
@@ -439,6 +664,7 @@ class RunMainExperimentTest(unittest.TestCase):
                 seed_metrics_paths=seed_metrics_paths,
                 seed_metrics_sha256={seed: file_sha256(path) for seed, path in seed_metrics_paths.items()},
                 integrity_fields=TEST_INTEGRITY_FIELDS,
+                **_summary_protocol_kwargs(),
             )
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
@@ -466,7 +692,7 @@ class RunMainExperimentTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "No confirmatory MTAM-HG metrics matched"):
+            with self.assertRaisesRegex(ValueError, "seed mismatch"):
                 require_fresh_seed_metrics(
                     run_dir,
                     before,
@@ -518,6 +744,7 @@ class RunMainExperimentTest(unittest.TestCase):
                     seed_metrics_paths=seed_metrics_paths,
                     seed_metrics_sha256=seed_metrics_sha256,
                     integrity_fields=TEST_INTEGRITY_FIELDS,
+                    **_summary_protocol_kwargs(),
                 )
 
     def test_fresh_metrics_rejects_multiple_new_artifacts(self) -> None:
@@ -529,6 +756,7 @@ class RunMainExperimentTest(unittest.TestCase):
                 "MAE": 0.8,
                 "MAPE": 3.4,
                 "R2": 0.9,
+                "TAIL_MAE": 2.5,
                 "Model": "mtam_hg",
                 "Experiment_Group": "mtam_hg_paper",
                 "Seed": 42,
@@ -556,6 +784,8 @@ class RunMainExperimentTest(unittest.TestCase):
             "Synthetic_SHA256": "6" * 64,
             "Generation_Seed": 1,
             "Config_SHA256": "7" * 64,
+            "Effective_Protocol_SHA256": "8" * 64,
+            "CBTG_Cross_Run_Validation_STD_SHA256": "9" * 64,
         }
         with tempfile.TemporaryDirectory() as tmp:
             metrics_path = Path(tmp) / "metrics.json"
@@ -582,16 +812,24 @@ class RunMainExperimentTest(unittest.TestCase):
                             expected_integrity=TEST_INTEGRITY_FIELDS,
                         )
 
+    @patch("run_experiment.validate_cbtg_cross_run_validation_std")
     @patch("run_experiment.validate_synthetic_provenance_for_runner")
-    def test_runner_integrity_rejects_runtime_source_or_synthetic_change(self, mock_validate) -> None:
+    def test_runner_integrity_rejects_runtime_source_or_synthetic_change(
+        self,
+        mock_validate,
+        mock_cross_run,
+    ) -> None:
+        mock_cross_run.return_value = {"sha256": "5" * 64}
         initial_provenance = {
             "combined_split_sha256": "1" * 64,
             "source_sha256": "2" * 64,
             "synthetic_sha256": "3" * 64,
+            "provenance_sha256": "7" * 64,
         }
         for provenance_field, metrics_field in (
             ("source_sha256", "Source_Data_SHA256"),
             ("synthetic_sha256", "Synthetic_SHA256"),
+            ("provenance_sha256", "Synthetic_Provenance_SHA256"),
         ):
             with self.subTest(field=metrics_field):
                 changed_provenance = {**initial_provenance, provenance_field: "4" * 64}
@@ -603,7 +841,12 @@ class RunMainExperimentTest(unittest.TestCase):
                     "stratified_random",
                     0,
                     "4" * 64,
+                    TEST_EFFECTIVE_PROTOCOL_SHA256,
+                    TEST_PRODUCER_PROTOCOL_SHA256,
+                    Path("cross_run.json"),
+                    "5" * 64,
                     label_col="屈服强度",
+                    scientific_code_hash="a" * 64,
                 )
 
                 with self.assertRaisesRegex(RuntimeError, metrics_field):
@@ -614,17 +857,25 @@ class RunMainExperimentTest(unittest.TestCase):
                         "stratified_random",
                         0,
                         "4" * 64,
+                        TEST_EFFECTIVE_PROTOCOL_SHA256,
+                        TEST_PRODUCER_PROTOCOL_SHA256,
+                        Path("cross_run.json"),
+                        "5" * 64,
                         label_col="屈服强度",
+                        scientific_code_hash="a" * 64,
                         expected_fields=expected,
                     )
 
+    @patch("run_experiment.validate_cbtg_cross_run_validation_std")
     @patch("run_experiment.validate_synthetic_provenance_for_runner")
-    def test_runner_integrity_passes_label_and_input_mode(self, mock_validate) -> None:
+    def test_runner_integrity_passes_label_and_input_mode(self, mock_validate, mock_cross_run) -> None:
         mock_validate.return_value = {
             "combined_split_sha256": "1" * 64,
             "source_sha256": "2" * 64,
             "synthetic_sha256": "3" * 64,
+            "provenance_sha256": "7" * 64,
         }
+        mock_cross_run.return_value = {"sha256": "5" * 64}
 
         validate_runner_integrity(
             Path("synthetic.xlsx"),
@@ -633,7 +884,12 @@ class RunMainExperimentTest(unittest.TestCase):
             "stratified_random",
             0,
             "4" * 64,
+            TEST_EFFECTIVE_PROTOCOL_SHA256,
+            TEST_PRODUCER_PROTOCOL_SHA256,
+            Path("cross_run.json"),
+            "5" * 64,
             label_col="target_column",
+            scientific_code_hash="a" * 64,
         )
 
         mock_validate.assert_called_once_with(
@@ -645,6 +901,15 @@ class RunMainExperimentTest(unittest.TestCase):
             label_col="target_column",
             use_el_as_input=False,
             validate_current_generation_config=True,
+            expected_scientific_code_sha256="a" * 64,
+            expected_generation_protocol_sha256=TEST_PRODUCER_PROTOCOL_SHA256,
+        )
+        mock_cross_run.assert_called_once_with(
+            Path("cross_run.json"),
+            expected_split_sha256="1" * 64,
+            expected_source_data_sha256="2" * 64,
+            expected_config_sha256="4" * 64,
+            expected_producer_protocol_sha256=TEST_PRODUCER_PROTOCOL_SHA256,
         )
 
     def test_summary_rejects_one_seed_with_a_different_integrity_hash(self) -> None:
@@ -682,6 +947,7 @@ class RunMainExperimentTest(unittest.TestCase):
                     seed_metrics_paths=seed_metrics_paths,
                     seed_metrics_sha256={seed: file_sha256(path) for seed, path in seed_metrics_paths.items()},
                     integrity_fields=TEST_INTEGRITY_FIELDS,
+                    **_summary_protocol_kwargs(),
                 )
 
     def test_metrics_integrity_fields_use_runner_provenance_hashes(self) -> None:
@@ -690,11 +956,14 @@ class RunMainExperimentTest(unittest.TestCase):
                 "combined_split_sha256": "1" * 64,
                 "source_sha256": "2" * 64,
                 "synthetic_sha256": "3" * 64,
+                "provenance_sha256": "7" * 64,
             },
             42,
             "stratified_random",
             0,
             "4" * 64,
+            TEST_EFFECTIVE_PROTOCOL_SHA256,
+            "5" * 64,
         )
 
         self.assertEqual(fields, TEST_INTEGRITY_FIELDS)
@@ -702,7 +971,7 @@ class RunMainExperimentTest(unittest.TestCase):
     def test_non_dry_summary_requires_all_ten_confirmatory_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp)
-            with self.assertRaisesRegex(ValueError, "requires exactly the ten ordered model seeds"):
+            with self.assertRaisesRegex(ValueError, "requires ten distinct model seeds"):
                 write_runner_summary(
                     output_root,
                     phases=[],
@@ -716,11 +985,11 @@ class RunMainExperimentTest(unittest.TestCase):
             [42],
             [*DEFAULT_SEEDS, 52],
             [42, 42, *DEFAULT_SEEDS[2:]],
-            list(reversed(DEFAULT_SEEDS)),
-            list(range(1, 11)),
         ):
-            with self.subTest(invalid_seeds=invalid_seeds), self.assertRaisesRegex(ValueError, "ten model seeds"):
+            with self.subTest(invalid_seeds=invalid_seeds), self.assertRaisesRegex(ValueError, "ten distinct"):
                 validate_args(build_parser().parse_args(["--seeds", *map(str, invalid_seeds)]))
+        validate_args(build_parser().parse_args(["--seeds", *map(str, reversed(DEFAULT_SEEDS))]))
+        validate_args(build_parser().parse_args(["--seeds", *map(str, range(1, 11))]))
         with self.assertRaisesRegex(ValueError, "split seed is fixed"):
             validate_args(build_parser().parse_args(["--split_seed", "43"]))
         with self.assertRaisesRegex(ValueError, "split method is fixed"):
@@ -729,8 +998,14 @@ class RunMainExperimentTest(unittest.TestCase):
             validate_args(build_parser().parse_args(["--generation_seed", "42"]))
         with self.assertRaisesRegex(ValueError, "main_experiment_name"):
             validate_args(build_parser().parse_args(["--main_experiment_name", "alternate_run"]))
-        with self.assertRaises(ValueError):
-            validate_args(build_parser().parse_args(["--epochs", "0"]))
+        with self.assertRaisesRegex(ValueError, "--epochs"):
+            validate_args(build_parser().parse_args(["--epochs", "51"]))
+        with self.assertRaisesRegex(ValueError, "--lr"):
+            validate_args(build_parser().parse_args(["--lr", "0.0005"]))
+        with self.assertRaisesRegex(ValueError, "--use_dynamic_synthetic_agent"):
+            validate_args(build_parser().parse_args(["--no_dynamic_synthetic_agent"]))
+        with self.assertRaisesRegex(ValueError, "--tabdiff_num_samples"):
+            validate_args(build_parser().parse_args(["--tabdiff_num_samples", "4999"]))
         with self.assertRaises(ValueError):
             validate_args(build_parser().parse_args(["--dynamic_synthetic_refresh_epochs", "0"]))
         with self.assertRaises(ValueError):

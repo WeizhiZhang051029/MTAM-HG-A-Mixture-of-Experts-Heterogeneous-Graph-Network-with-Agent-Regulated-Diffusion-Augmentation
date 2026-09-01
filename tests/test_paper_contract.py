@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
+from sklearn.preprocessing import QuantileTransformer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -119,10 +120,18 @@ class PaperContractTest(unittest.TestCase):
         )
         rng = np.random.default_rng(42)
         raw = rng.normal(size=(64, 1 + len(EXPECTED_INPUTS))).astype(np.float32)
+        transformer = QuantileTransformer(
+            n_quantiles=len(raw),
+            output_distribution="normal",
+            random_state=0,
+        )
+        transformed = transformer.fit_transform(raw).astype(np.float32)
         constraint = CAPLMechanismConstraint(
             [config.LABEL_COL, *EXPECTED_INPUTS],
-            transformed_train=raw,
+            transformed_train=transformed,
             raw_train=raw,
+            quantile_values=transformer.quantiles_,
+            quantile_references=transformer.references_,
             temperature_hold_tolerance=10.0,
             yield_tolerance=0.0,
         )
@@ -164,7 +173,7 @@ class PaperContractTest(unittest.TestCase):
         self.assertTrue(config.DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT)
         self.assertEqual(config.DYNAMIC_SYNTHETIC_PROCESS_POWER, 1.0)
         self.assertEqual(config.DYNAMIC_SYNTHETIC_MECHANISM_POWER, 1.0)
-        self.assertEqual(config.SYNTHETIC_AGENT_EPOCHS, 20)
+        self.assertEqual(config.SYNTHETIC_AGENT_EPOCHS, 100)
         self.assertEqual(config.SYNTHETIC_AGENT_LR, 1.0e-3)
 
     def test_moe_ipohgn_hsg_and_mr_lora_hyperparameters_match_the_paper(self) -> None:

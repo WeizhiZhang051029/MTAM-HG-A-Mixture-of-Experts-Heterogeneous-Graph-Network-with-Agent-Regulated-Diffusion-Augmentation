@@ -20,19 +20,10 @@ class CAPLMechanismWeights:
 
 
 class CAPLMechanismConstraint(nn.Module):
-    """Paper-aligned mechanism energy for MP-TabDiff.
+    """Mechanism energy evaluated in CAPL physical units."""
 
-    The joint numerical vector is ordered as ``[yield, x_1, ..., x_21]``.
-    TabDiff operates in transformed coordinates, so an affine training-set
-    proxy maps those coordinates back to physical units before evaluating
-    exactly the three terms reported in the paper: furnace temperature path,
-    feature-only production windows, and the empirical yield response.
-
-    The paper dataset contains one soaking-furnace variable (``SF_T``). It is
-    therefore used for both ``T_soak,start`` and ``T_soak,end`` in Eq. (6),
-    while ``HF_T`` and ``SC_T`` provide ``T_heat`` and ``T_cool``. This keeps
-    the implemented constraint within the 21 measured variables.
-    """
+    QUANTILE_BOUND_THRESHOLD = 1.0e-7
+    TEMPERATURE_PATH_COLUMNS = ("JPF_PT", "HF_T", "SF_T", "SC_T")
 
     def __init__(
         self,
@@ -40,6 +31,8 @@ class CAPLMechanismConstraint(nn.Module):
         transformed_train: np.ndarray,
         raw_train: np.ndarray,
         *,
+        quantile_values: np.ndarray,
+        quantile_references: np.ndarray,
         low_quantile: float = 0.01,
         high_quantile: float = 0.99,
         margin: float = 0.10,
@@ -63,6 +56,18 @@ class CAPLMechanismConstraint(nn.Module):
             raise ValueError("column_names length must match numerical feature dimension.")
         if transformed.shape[1] < 2:
             raise ValueError("The joint MP-TabDiff vector must contain yield plus CAPL features.")
+        quantiles = np.asarray(quantile_values, dtype=np.float32)
+        references = np.asarray(quantile_references, dtype=np.float32)
+        if quantiles.ndim != 2 or quantiles.shape[1] != transformed.shape[1]:
+            raise ValueError("quantile_values must match the joint numerical feature dimension.")
+        if references.ndim != 1 or references.shape[0] != quantiles.shape[0]:
+            raise ValueError("quantile_references must match the quantile grid.")
+        if references.shape[0] < 2 or np.any(np.diff(references) <= 0.0):
+            raise ValueError("quantile_references must be strictly increasing.")
+        if not np.isclose(references[0], 0.0) or not np.isclose(references[-1], 1.0):
+            raise ValueError("quantile_references must span [0, 1].")
+        if np.any(np.diff(quantiles, axis=0) < 0.0):
+            raise ValueError("quantile_values must be non-decreasing by feature.")
         if not 0.0 <= float(low_quantile) < float(high_quantile) <= 1.0:
             raise ValueError("Expected 0 <= low_quantile < high_quantile <= 1.")
         if float(margin) < 0.0:
@@ -82,9 +87,7 @@ class CAPLMechanismConstraint(nn.Module):
         transformed_mean = np.nanmean(transformed, axis=0)
         transformed_std = np.nanstd(transformed, axis=0)
         raw_mean = np.nanmean(raw, axis=0)
-        raw_std = np.nanstd(raw, axis=0)
         transformed_std = np.where(transformed_std < 1.0e-6, 1.0, transformed_std)
-        raw_std = np.where(raw_std < 1.0e-6, 1.0, raw_std)
 
         # Eq. (7) is defined only over x, never over the generated target y.
         raw_features = raw[:, 1:]
@@ -97,7 +100,8 @@ class CAPLMechanismConstraint(nn.Module):
         self.register_buffer("transformed_mean", torch.tensor(transformed_mean, dtype=torch.float32))
         self.register_buffer("transformed_std", torch.tensor(transformed_std, dtype=torch.float32))
         self.register_buffer("raw_mean", torch.tensor(raw_mean, dtype=torch.float32))
-        self.register_buffer("raw_std", torch.tensor(raw_std, dtype=torch.float32))
+        self.register_buffer("quantile_values", torch.tensor(quantiles, dtype=torch.float32))
+        self.register_buffer("quantile_references", torch.tensor(references, dtype=torch.float32))
         self.register_buffer("window_low", torch.tensor(low, dtype=torch.float32))
         self.register_buffer("window_high", torch.tensor(high, dtype=torch.float32))
         self.register_buffer("window_spread", torch.tensor(spread, dtype=torch.float32))
@@ -115,6 +119,7 @@ class CAPLMechanismConstraint(nn.Module):
         data_dir: str | Path,
         info: dict[str, Any],
         transformed_train: np.ndarray,
+        quantile_transformer: Any,
         **kwargs: Any,
     ) -> "CAPLMechanismConstraint":
         data_path = Path(data_dir)
@@ -123,16 +128,57 @@ class CAPLMechanismConstraint(nn.Module):
         raw_train = np.concatenate([y, x_num], axis=1)
         column_names = [info["column_names"][info["target_col_idx"][0]]]
         column_names.extend(info["column_names"][idx] for idx in info["num_col_idx"])
-        return cls(column_names, transformed_train, raw_train, **kwargs)
+        if getattr(quantile_transformer, "output_distribution", None) != "normal":
+            raise ValueError("MP-TabDiff requires a normal-output QuantileTransformer.")
+        return cls(
+            column_names,
+            transformed_train,
+            raw_train,
+            quantile_values=quantile_transformer.quantiles_,
+            quantile_references=quantile_transformer.references_,
+            **kwargs,
+        )
 
-    def proxy_to_physical(self, x_transformed: torch.Tensor) -> torch.Tensor:
-        return (x_transformed - self.transformed_mean) / self.transformed_std * self.raw_std + self.raw_mean
+    def to_physical(self, x_transformed: torch.Tensor) -> torch.Tensor:
+        """Invert the fitted QuantileTransformer with linear interpolation."""
+
+        if x_transformed.shape[-1] != self.quantile_values.shape[1]:
+            raise ValueError("x_transformed has an unexpected numerical feature dimension.")
+        original_shape = x_transformed.shape
+        flat = x_transformed.reshape(-1, original_shape[-1])
+        probabilities = 0.5 * (1.0 + torch.erf(flat / np.sqrt(2.0)))
+        references = self.quantile_references.to(dtype=flat.dtype)
+        lower_bound = probabilities - self.QUANTILE_BOUND_THRESHOLD < references[0]
+        upper_bound = probabilities + self.QUANTILE_BOUND_THRESHOLD > references[-1]
+        nan_mask = torch.isnan(probabilities)
+        probabilities = torch.nan_to_num(
+            probabilities,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(references[0], references[-1])
+
+        upper = torch.searchsorted(references, probabilities, right=True)
+        upper = upper.clamp(1, references.numel() - 1)
+        lower = upper - 1
+        feature = torch.arange(flat.shape[1], device=flat.device).unsqueeze(0).expand_as(lower)
+        values = self.quantile_values.to(dtype=flat.dtype)
+        value_low = values[lower, feature]
+        value_high = values[upper, feature]
+        reference_low = references[lower]
+        reference_high = references[upper]
+        fraction = (probabilities - reference_low) / (reference_high - reference_low)
+        physical = value_low + fraction * (value_high - value_low)
+        physical = torch.where(lower_bound, values[0].unsqueeze(0), physical)
+        physical = torch.where(upper_bound, values[-1].unsqueeze(0), physical)
+        physical = torch.where(nan_mask, flat, physical)
+        return physical.reshape(original_shape)
 
     def forward(self, x_transformed: torch.Tensor, reduce: bool = True) -> torch.Tensor:
         if not self.enabled:
             energy = x_transformed.new_zeros(x_transformed.shape[0])
             return energy.mean() if reduce else energy
-        physical = self.proxy_to_physical(x_transformed)
+        physical = self.to_physical(x_transformed)
         parts = self.energy_parts_from_physical(physical)
         energy = (
             self.weights.temperature_path * parts["temperature_path"]
@@ -197,10 +243,13 @@ class CAPLMechanismConstraint(nn.Module):
                 f"Missing the paper-required {role} temperature column; tried {list(aliases)}."
             )
 
-        heat = resolve("heating-furnace", ("HF_T", "HF-T", "HF T", "加热炉温度"))
-        soak = resolve("soaking-furnace", ("SF_T", "SF-T", "SF T", "均热炉温度"))
+        heat = resolve("preheating-furnace", ("JPF_PT", "JPF-PT", "JPF PT", "JPF预热炉温度"))
+        soak_start = resolve("heating-furnace", ("HF_T", "HF-T", "HF T", "加热炉温度"))
+        soak_end = resolve("soaking-furnace", ("SF_T", "SF-T", "SF T", "均热炉温度"))
         cool = resolve("slow-cooling-furnace", ("SC_T", "SC-T", "SC T", "缓冷炉温度"))
-        return [(heat, soak, soak, cool)]
+        if len({heat, soak_start, soak_end, cool}) != 4:
+            raise ValueError("The CAPL temperature path requires four distinct measurements.")
+        return [(heat, soak_start, soak_end, cool)]
 
     @staticmethod
     def _fit_ridge_yield_proxy(raw: np.ndarray, ridge_alpha: float) -> tuple[np.ndarray, float]:

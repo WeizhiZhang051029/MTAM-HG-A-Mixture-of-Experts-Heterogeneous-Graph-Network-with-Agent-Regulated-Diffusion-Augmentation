@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -257,6 +258,9 @@ def train_one_epoch(
     optimizer,
     device: torch.device,
     cluster_model: WorkingConditionCluster | None = None,
+    batch_weight_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+    use_internal_agent_weight: bool | None = None,
+    use_agent_reward: bool | None = None,
 ) -> dict[str, float]:
     model.train()
     accum: dict[str, float] = {}
@@ -268,13 +272,24 @@ def train_one_epoch(
         if cluster_model is not None and cluster_model.is_fitted:
             cluster_labels = cluster_model.predict_tensor(x).to(device)
         outputs = model(x)
+        batch_weights: torch.Tensor | None = None
+        if batch_weight_fn is not None:
+            batch_weights = batch_weight_fn(x, y).detach().to(device=device, dtype=y.dtype)
+            if batch_weights.numel() != y.shape[0]:
+                raise ValueError("Batch weights must contain one value per training sample.")
+            batch_weights = batch_weights.reshape(-1, 1)
+            if not torch.isfinite(batch_weights).all() or torch.any(batch_weights < 0.0):
+                raise ValueError("Batch weights must be finite and non-negative.")
         loss, logs = total_loss(
             outputs,
             y,
             x=x,
             mask=None,
             edge_mask=None,
+            batch_weights=batch_weights,
             cluster_labels=cluster_labels,
+            use_internal_agent_weight=use_internal_agent_weight,
+            use_agent_reward=use_agent_reward,
         )
 
         optimizer.zero_grad()
@@ -405,12 +420,27 @@ def supervised_finetune(
     device: torch.device,
     epochs: int | None = None,
     freeze_backbone: bool | None = None,
+    quality_agent: torch.nn.Module | None = None,
+    quality_agent_calibration_fn: Callable[
+        [torch.nn.Module, torch.nn.Module, object, torch.device, int],
+        tuple[
+            dict[str, float],
+            Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        ],
+    ]
+    | None = None,
 ) -> tuple[float, int, int, bool]:
+    if (quality_agent is None) != (quality_agent_calibration_fn is None):
+        raise ValueError("quality_agent and quality_agent_calibration_fn must be provided together.")
     save_split_artifacts(data_bundle, config.RESULT_DIR)
     epochs = config.EPOCHS if epochs is None else epochs
     mr_lora_summary = maybe_enable_mr_lora(model, device=device)
     finetune_policy = configure_finetune_trainability(model, freeze_backbone=freeze_backbone)
     finetune_policy["mr_lora_injection"] = mr_lora_summary
+    finetune_policy["cbtg_quality_agent_calibration"] = quality_agent is not None
+    finetune_policy["cbtg_external_prediction_weights"] = quality_agent is not None
+    finetune_policy["internal_router_sample_weights"] = False if quality_agent is not None else None
+    finetune_policy["internal_router_reward"] = False if quality_agent is not None else None
     save_json(config.RESULT_DIR / "finetune_policy.json", finetune_policy)
     optimizer = build_finetune_optimizer(model)
 
@@ -439,7 +469,26 @@ def supervised_finetune(
     progress = tqdm(range(1, epochs + 1), desc="Supervised finetune", unit="epoch")
     for epoch in progress:
         epochs_run = epoch
-        train_logs = train_one_epoch(model, data_bundle.train_loader, optimizer, device, cluster_model=cluster_model)
+        if quality_agent is not None and quality_agent_calibration_fn is not None:
+            quality_agent_logs, batch_weight_fn = quality_agent_calibration_fn(
+                model,
+                quality_agent,
+                data_bundle,
+                device,
+                epoch,
+            )
+        else:
+            quality_agent_logs, batch_weight_fn = {}, None
+        train_logs = train_one_epoch(
+            model,
+            data_bundle.train_loader,
+            optimizer,
+            device,
+            cluster_model=cluster_model,
+            batch_weight_fn=batch_weight_fn,
+            use_internal_agent_weight=False if quality_agent is not None else None,
+            use_agent_reward=False if quality_agent is not None else None,
+        )
         train_metrics, _ = evaluate_model(model, data_bundle.train_loader, device, data_bundle)
         val_metrics, _ = evaluate_model(model, data_bundle.val_loader, device, data_bundle)
         checkpoint_score, checkpoint_score_logs = checkpoint_selection_score(val_metrics)
@@ -471,6 +520,7 @@ def supervised_finetune(
             "mask_loss": train_logs.get("mask_loss", float("nan")),
             "edge_loss": train_logs.get("edge_loss", float("nan")),
             **train_logs,
+            **quality_agent_logs,
             **{
                 f"val_{k}": v
                 for k, v in val_metrics.items()
@@ -487,17 +537,18 @@ def supervised_finetune(
             best_score = checkpoint_score
             best_epoch = epoch
             epochs_without_improvement = 0
-            torch.save(
-                checkpoint_payload(
-                    model,
-                    data_bundle,
-                    epoch,
-                    best_rmse=float(val_metrics["RMSE"]),
-                    best_checkpoint_score=best_score,
-                    **checkpoint_score_logs,
-                ),
-                ckpt_path,
+            checkpoint = checkpoint_payload(
+                model,
+                data_bundle,
+                epoch,
+                best_rmse=float(val_metrics["RMSE"]),
+                best_checkpoint_score=best_score,
+                **checkpoint_score_logs,
             )
+            if quality_agent is not None:
+                checkpoint["synthetic_quality_agent_state_dict"] = quality_agent.state_dict()
+                checkpoint["cbtg_real_calibrated"] = True
+            torch.save(checkpoint, ckpt_path)
         else:
             epochs_without_improvement += 1
             if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:

@@ -61,6 +61,11 @@ def apply_trainable_scope(model, scope):
             param.requires_grad = True
 
 
+def validate_trainable_scope(scope, checkpoint_path):
+    if str(scope or "all").lower() != "all" and not checkpoint_path:
+        raise ValueError("A pretrained checkpoint is required for partial TabDiff fine-tuning.")
+
+
 def build_capl_mechanism(args, data_dir, info, train_data):
     if not args.mechanism_constraint:
         return None
@@ -73,6 +78,7 @@ def build_capl_mechanism(args, data_dir, info, train_data):
         data_dir,
         info,
         train_data.X.detach().cpu().numpy()[:, : train_data.d_numerical],
+        train_data.num_transform,
         low_quantile=args.mechanism_low_quantile,
         high_quantile=args.mechanism_high_quantile,
         margin=args.mechanism_window_margin,
@@ -247,6 +253,8 @@ def main(args):
     )
     model = Model(backbone, **raw_config['diffusion_params']['edm_params'])
     model.to(device)
+    if args.mode == 'train':
+        validate_trainable_scope(args.trainable_scope, ckpt_path)
     apply_trainable_scope(model, args.trainable_scope)
     
     ## Create and load y_only_model for imputation

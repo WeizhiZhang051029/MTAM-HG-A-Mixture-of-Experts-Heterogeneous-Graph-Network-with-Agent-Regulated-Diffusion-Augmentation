@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -14,8 +15,14 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-PROVENANCE_FORMAT = "mtam_hg_synthetic_provenance_v1"
+PROVENANCE_FORMAT = "mtam_hg_synthetic_provenance_v2"
 TABDIFF_DETERMINISTIC_SEED = 0
+CBTG_CROSS_RUN_METRICS = ("RMSE", "MAE", "MAPE", "ONE_MINUS_R2", "TAIL_MAE")
+CBTG_CROSS_RUN_FORMAT = "mtam_hg_cbtg_cross_run_v1"
+CBTG_CROSS_RUN_SOURCE = "independent_validation_runs"
+CBTG_CROSS_RUN_COUNT = 10
+CBTG_CROSS_RUN_PARTITION = "validation"
+CBTG_CROSS_RUN_DDOF = 1
 
 
 class FileMutationError(RuntimeError):
@@ -24,6 +31,10 @@ class FileMutationError(RuntimeError):
 
 class SyntheticProvenanceError(RuntimeError):
     """Raised when synthetic data cannot be tied to the active run protocol."""
+
+
+class ProtocolIntegrityError(RuntimeError):
+    """Raised when a confirmatory protocol artifact is invalid."""
 
 
 @dataclass(frozen=True)
@@ -145,6 +156,360 @@ def canonical_sha256(value: object) -> str:
 def file_sha256(path: str | Path) -> str:
     """Return the SHA-256 digest of one stable file snapshot."""
     return capture_file_snapshot(path).sha256
+
+
+def scientific_code_sha256(project_root: str | Path | None = None) -> str:
+    """Fingerprint the scientific Python implementation."""
+    root = Path(project_root).resolve() if project_root is not None else Path(__file__).resolve().parent
+    source_files = [path for path in root.glob("*.py") if path.is_file()]
+    for directory in ("generation", "models", "training", "utils", "third_party/TabDiff"):
+        source_files.extend(
+            path
+            for path in (root / directory).rglob("*.py")
+            if path.is_file() and "__pycache__" not in path.parts
+        )
+    source_files.extend(
+        path
+        for path in (root / "third_party" / "TabDiff" / "tabdiff" / "configs").rglob("*.toml")
+        if path.is_file()
+    )
+    manifest = {
+        path.resolve().relative_to(root).as_posix(): file_sha256(path)
+        for path in sorted(set(source_files))
+    }
+    return canonical_sha256(manifest)
+
+
+def _protocol_sha256(value: object, name: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+        raise ProtocolIntegrityError(f"CBTG cross-run {name} is invalid.")
+    return value.lower()
+
+
+def _protocol_metric_vector(value: object, name: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != len(CBTG_CROSS_RUN_METRICS):
+        raise ProtocolIntegrityError(f"CBTG cross-run {name} requires five ordered values.")
+    if any(
+        isinstance(item, bool)
+        or not isinstance(item, (int, float))
+        or not np.isfinite(float(item))
+        for item in value
+    ):
+        raise ProtocolIntegrityError(f"CBTG cross-run {name} must contain finite numbers.")
+    return [float(item) for item in value]
+
+
+def _aliased_value(payload: Mapping[str, object], names: Sequence[str], label: str) -> object:
+    present = [name for name in names if name in payload]
+    if not present:
+        raise ProtocolIntegrityError(f"Validation metrics artifact is missing {label}.")
+    first = payload[present[0]]
+    if any(payload[name] != first for name in present[1:]):
+        raise ProtocolIntegrityError(f"Validation metrics artifact has conflicting {label} fields.")
+    return first
+
+
+def _aliased_sha256(payload: Mapping[str, object], names: Sequence[str], label: str) -> str:
+    present = [name for name in names if name in payload]
+    if not present:
+        raise ProtocolIntegrityError(f"Validation metrics artifact is missing {label}.")
+    values = [_protocol_sha256(payload[name], label) for name in present]
+    if len(set(values)) != 1:
+        raise ProtocolIntegrityError(f"Validation metrics artifact has conflicting {label} fields.")
+    return values[0]
+
+
+def _validation_metrics_from_artifact(payload: Mapping[str, object]) -> list[float]:
+    nested = payload.get("validation_metrics")
+    if isinstance(nested, list):
+        return _protocol_metric_vector(nested, "validation_metrics")
+    metrics = nested if isinstance(nested, Mapping) else payload
+    values: list[object] = []
+    for name in CBTG_CROSS_RUN_METRICS:
+        if name == "ONE_MINUS_R2" and name not in metrics and "R2" in metrics:
+            r2 = metrics["R2"]
+            if isinstance(r2, bool) or not isinstance(r2, (int, float)):
+                raise ProtocolIntegrityError("Validation metrics artifact R2 must be numeric.")
+            values.append(1.0 - float(r2))
+        elif name in metrics:
+            values.append(metrics[name])
+        else:
+            raise ProtocolIntegrityError(f"Validation metrics artifact is missing {name}.")
+    return _protocol_metric_vector(values, "validation_metrics")
+
+
+def validate_cbtg_cross_run_validation_std(
+    path: str | Path,
+    *,
+    expected_split_sha256: str | None = None,
+    expected_combined_split_sha256: str | None = None,
+    expected_source_data_sha256: str | None = None,
+    expected_config_sha256: str | None = None,
+    expected_producer_protocol_sha256: str | None = None,
+) -> dict[str, object]:
+    """Validate reproducible cross-run validation statistics used by CBTG."""
+    try:
+        snapshot = capture_file_snapshot(path, include_content=True)
+        assert snapshot.content is not None
+        payload = json.loads(snapshot.content.decode("utf-8"))
+    except (FileMutationError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProtocolIntegrityError(f"Invalid CBTG cross-run statistics: {Path(path)}") from exc
+    if not isinstance(payload, Mapping):
+        raise ProtocolIntegrityError("CBTG cross-run statistics must be a JSON object.")
+    if payload.get("format") != CBTG_CROSS_RUN_FORMAT:
+        raise ProtocolIntegrityError("CBTG cross-run format is invalid.")
+    if payload.get("source") != CBTG_CROSS_RUN_SOURCE:
+        raise ProtocolIntegrityError("CBTG cross-run statistics must come from independent validation runs.")
+    if payload.get("partition") != CBTG_CROSS_RUN_PARTITION:
+        raise ProtocolIntegrityError("CBTG cross-run partition must be validation.")
+    ddof = payload.get("ddof")
+    if isinstance(ddof, bool) or not isinstance(ddof, int) or ddof != CBTG_CROSS_RUN_DDOF:
+        raise ProtocolIntegrityError("CBTG cross-run ddof must be 1.")
+    if payload.get("metric_names") != list(CBTG_CROSS_RUN_METRICS):
+        raise ProtocolIntegrityError("CBTG cross-run metric order is invalid.")
+    values = _protocol_metric_vector(payload.get("validation_metric_std"), "validation_metric_std")
+    if any(value < 0.0 for value in values):
+        raise ProtocolIntegrityError("CBTG cross-run statistics must be finite and non-negative.")
+    num_runs = payload.get("num_runs")
+    if (
+        isinstance(num_runs, bool)
+        or not isinstance(num_runs, int)
+        or num_runs != CBTG_CROSS_RUN_COUNT
+    ):
+        raise ProtocolIntegrityError("CBTG cross-run statistics require ten independent runs.")
+    combined_fields = [name for name in ("combined_split_sha256", "split_sha256") if name in payload]
+    if not combined_fields:
+        raise ProtocolIntegrityError("CBTG cross-run combined_split_sha256 is required.")
+    combined_values = [
+        _protocol_sha256(payload[name], "combined_split_sha256") for name in combined_fields
+    ]
+    if len(set(combined_values)) != 1:
+        raise ProtocolIntegrityError("CBTG cross-run split hash fields conflict.")
+    combined_split_sha256 = combined_values[0]
+    expected_splits = [
+        _protocol_sha256(value, "expected combined split SHA-256")
+        for value in (expected_split_sha256, expected_combined_split_sha256)
+        if value is not None
+    ]
+    if len(set(expected_splits)) > 1:
+        raise ProtocolIntegrityError("Expected CBTG cross-run split hashes conflict.")
+    if expected_splits and combined_split_sha256 != expected_splits[0]:
+        raise ProtocolIntegrityError("CBTG cross-run statistics do not match the active split.")
+    source_data_sha256 = _protocol_sha256(payload.get("source_data_sha256"), "source_data_sha256")
+    config_sha256 = _protocol_sha256(payload.get("config_sha256"), "config_sha256")
+    producer_protocol_sha256 = _protocol_sha256(
+        payload.get("producer_protocol_sha256"),
+        "producer_protocol_sha256",
+    )
+    expected_hashes = (
+        (expected_source_data_sha256, source_data_sha256, "source data"),
+        (expected_config_sha256, config_sha256, "active YAML configuration"),
+        (
+            expected_producer_protocol_sha256,
+            producer_protocol_sha256,
+            "producer protocol",
+        ),
+    )
+    for expected, recorded, label in expected_hashes:
+        if expected is not None and _protocol_sha256(expected, f"expected {label} SHA-256") != recorded:
+            raise ProtocolIntegrityError(f"CBTG cross-run statistics do not match the {label}.")
+    runs = payload.get("runs")
+    if not isinstance(runs, list) or len(runs) != CBTG_CROSS_RUN_COUNT:
+        raise ProtocolIntegrityError("CBTG cross-run statistics require ten run records.")
+    normalized_runs: list[dict[str, object]] = []
+    artifact_hashes: set[str] = set()
+    for run in runs:
+        if not isinstance(run, Mapping):
+            raise ProtocolIntegrityError("CBTG cross-run run records must be JSON objects.")
+        artifact_sha256 = _protocol_sha256(
+            run.get("metrics_artifact_sha256"),
+            "metrics_artifact_sha256",
+        )
+        if artifact_sha256 in artifact_hashes:
+            raise ProtocolIntegrityError("CBTG cross-run metrics artifacts must be unique.")
+        artifact_hashes.add(artifact_sha256)
+        run_metrics = _protocol_metric_vector(run.get("validation_metrics"), "validation_metrics")
+        normalized_runs.append(
+            {
+                "metrics_artifact_sha256": artifact_sha256,
+                "validation_metrics": run_metrics,
+            }
+        )
+    matrix = np.asarray(
+        [run["validation_metrics"] for run in normalized_runs],
+        dtype=np.float64,
+    )
+    recomputed = np.std(matrix, axis=0, ddof=CBTG_CROSS_RUN_DDOF)
+    if not np.allclose(np.asarray(values), recomputed, rtol=1.0e-12, atol=1.0e-12):
+        raise ProtocolIntegrityError("CBTG cross-run aggregate does not match the run matrix.")
+    assert_file_snapshot_current(snapshot, "CBTG cross-run statistics")
+    return {
+        "path": str(snapshot.path),
+        "sha256": snapshot.sha256,
+        "payload": {
+            "format": CBTG_CROSS_RUN_FORMAT,
+            "source": CBTG_CROSS_RUN_SOURCE,
+            "partition": CBTG_CROSS_RUN_PARTITION,
+            "ddof": CBTG_CROSS_RUN_DDOF,
+            "metric_names": list(CBTG_CROSS_RUN_METRICS),
+            "validation_metric_std": values,
+            "num_runs": int(num_runs),
+            "source_data_sha256": source_data_sha256,
+            "combined_split_sha256": combined_split_sha256,
+            "config_sha256": config_sha256,
+            "producer_protocol_sha256": producer_protocol_sha256,
+            "runs": normalized_runs,
+        },
+    }
+
+
+def produce_cbtg_cross_run_validation_std(
+    metrics_artifact_paths: Sequence[str | Path] | Mapping[object, str | Path],
+    output_path: str | Path,
+    *,
+    source_data_sha256: str,
+    combined_split_sha256: str,
+    config_sha256: str,
+    producer_protocol_sha256: str,
+) -> dict[str, object]:
+    """Build a cross-run artifact from ten validation metrics files."""
+    expected_hashes = {
+        "source_data_sha256": _protocol_sha256(source_data_sha256, "source_data_sha256"),
+        "combined_split_sha256": _protocol_sha256(
+            combined_split_sha256,
+            "combined_split_sha256",
+        ),
+        "config_sha256": _protocol_sha256(config_sha256, "config_sha256"),
+        "producer_protocol_sha256": _protocol_sha256(
+            producer_protocol_sha256,
+            "producer_protocol_sha256",
+        ),
+    }
+    if isinstance(metrics_artifact_paths, Mapping):
+        supplied = list(metrics_artifact_paths.values())
+    elif isinstance(metrics_artifact_paths, Sequence) and not isinstance(
+        metrics_artifact_paths,
+        (str, bytes, Path),
+    ):
+        supplied = list(metrics_artifact_paths)
+    else:
+        raise ProtocolIntegrityError("CBTG producer requires ten validation metrics paths.")
+    if len(supplied) != CBTG_CROSS_RUN_COUNT:
+        raise ProtocolIntegrityError("CBTG producer requires ten validation metrics paths.")
+
+    output = Path(output_path).resolve()
+    snapshots: list[FileSnapshot] = []
+    records: list[dict[str, object]] = []
+    artifact_paths: set[Path] = set()
+    artifact_hashes: set[str] = set()
+    for artifact_path in supplied:
+        try:
+            snapshot = capture_file_snapshot(artifact_path, include_content=True)
+            assert snapshot.content is not None
+            artifact = json.loads(snapshot.content.decode("utf-8"))
+        except (FileMutationError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProtocolIntegrityError(
+                f"Invalid validation metrics artifact: {Path(artifact_path)}"
+            ) from exc
+        if snapshot.path == output:
+            raise ProtocolIntegrityError("CBTG output cannot overwrite a validation metrics artifact.")
+        if snapshot.path in artifact_paths or snapshot.sha256 in artifact_hashes:
+            raise ProtocolIntegrityError("Validation metrics artifacts must be unique files.")
+        artifact_paths.add(snapshot.path)
+        artifact_hashes.add(snapshot.sha256)
+        if not isinstance(artifact, Mapping):
+            raise ProtocolIntegrityError("Validation metrics artifact must be a JSON object.")
+        partition = _aliased_value(
+            artifact,
+            ("partition", "Partition", "Data_Partition"),
+            "partition",
+        )
+        if partition != CBTG_CROSS_RUN_PARTITION:
+            raise ProtocolIntegrityError("Validation metrics artifact partition must be validation.")
+        recorded_hashes = {
+            "source_data_sha256": _aliased_sha256(
+                artifact,
+                ("source_data_sha256", "Source_Data_SHA256"),
+                "source_data_sha256",
+            ),
+            "combined_split_sha256": _aliased_sha256(
+                artifact,
+                ("combined_split_sha256", "Combined_Split_SHA256", "split_sha256"),
+                "combined_split_sha256",
+            ),
+            "config_sha256": _aliased_sha256(
+                artifact,
+                ("config_sha256", "Config_SHA256"),
+                "config_sha256",
+            ),
+            "producer_protocol_sha256": _aliased_sha256(
+                artifact,
+                (
+                    "producer_protocol_sha256",
+                    "effective_protocol_sha256",
+                    "Effective_Protocol_SHA256",
+                ),
+                "producer_protocol_sha256",
+            ),
+        }
+        for name, expected in expected_hashes.items():
+            if recorded_hashes[name] != expected:
+                raise ProtocolIntegrityError(
+                    f"Validation metrics artifact does not match {name}."
+                )
+        records.append(
+            {
+                "metrics_artifact_sha256": snapshot.sha256,
+                "validation_metrics": _validation_metrics_from_artifact(artifact),
+            }
+        )
+        snapshots.append(snapshot)
+
+    matrix = np.asarray([run["validation_metrics"] for run in records], dtype=np.float64)
+    payload: dict[str, object] = {
+        "format": CBTG_CROSS_RUN_FORMAT,
+        "source": CBTG_CROSS_RUN_SOURCE,
+        "partition": CBTG_CROSS_RUN_PARTITION,
+        "ddof": CBTG_CROSS_RUN_DDOF,
+        "metric_names": list(CBTG_CROSS_RUN_METRICS),
+        "validation_metric_std": np.std(
+            matrix,
+            axis=0,
+            ddof=CBTG_CROSS_RUN_DDOF,
+        ).tolist(),
+        "num_runs": len(records),
+        **expected_hashes,
+        "runs": records,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            dir=output.parent,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for snapshot in snapshots:
+            assert_file_snapshot_current(snapshot, "validation metrics artifact")
+        os.replace(temporary, output)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return validate_cbtg_cross_run_validation_std(
+        output,
+        expected_combined_split_sha256=expected_hashes["combined_split_sha256"],
+        expected_source_data_sha256=expected_hashes["source_data_sha256"],
+        expected_config_sha256=expected_hashes["config_sha256"],
+        expected_producer_protocol_sha256=expected_hashes["producer_protocol_sha256"],
+    )
 
 
 def schema_sha256(columns: Sequence[object]) -> str:
@@ -348,7 +713,28 @@ def _require_sha256(value: object, name: str) -> str:
         raise SyntheticProvenanceError(
             f"Synthetic provenance field {name!r} must be a SHA-256 string."
         )
-    return value
+    return value.lower()
+
+
+def _capture_bound_dependency(
+    payload: Mapping[str, object],
+    *,
+    path_field: str,
+    sha256_field: str,
+    field_prefix: str,
+    label: str,
+) -> FileSnapshot:
+    raw_path = str(payload.get(path_field, "") or "").strip()
+    if not raw_path:
+        raise SyntheticProvenanceError(f"Synthetic provenance field {path_field!r} is required.")
+    try:
+        snapshot = capture_file_snapshot(_project_path(raw_path))
+    except FileMutationError as exc:
+        raise SyntheticProvenanceError(f"Synthetic provenance {label} was not found: {raw_path}") from exc
+    field_name = f"{field_prefix}.{sha256_field}"
+    expected_sha256 = _require_sha256(payload.get(sha256_field), field_name)
+    _expect_equal(field_name, snapshot.sha256, expected_sha256)
+    return snapshot
 
 
 def _synthetic_layout(path: Path) -> tuple[int, list[str]]:
@@ -365,6 +751,7 @@ def _validate_common(
     synthetic_path: Path,
     *,
     source_sha256: str,
+    source_path: str | Path | None,
     split_seed: int,
     split_method: str,
     generation_seed: int,
@@ -373,6 +760,8 @@ def _validate_common(
     schema_hash: str | None = None,
     validate_current_generation_config: bool = True,
     synthetic_snapshot: TableSnapshot | None = None,
+    expected_scientific_code_sha256: str | None = None,
+    expected_generation_protocol_sha256: str | None = None,
 ) -> dict[str, object]:
     resolved_synthetic = synthetic_path.resolve()
     try:
@@ -396,6 +785,19 @@ def _validate_common(
     recorded_source_hash = _require_sha256(source.get("sha256"), "source.sha256")
     _expect_equal("synthetic.sha256", synthetic_hash, table_snapshot.file.sha256)
     _expect_equal("source.sha256", recorded_source_hash, source_sha256)
+    recorded_synthetic_path = str(synthetic.get("path", "") or "").strip()
+    if not recorded_synthetic_path:
+        raise SyntheticProvenanceError("Synthetic provenance field 'synthetic.path' is required.")
+    _expect_equal("synthetic.path", _project_path(recorded_synthetic_path), resolved_synthetic)
+    source_snapshot = _capture_bound_dependency(
+        source,
+        path_field="path",
+        sha256_field="sha256",
+        field_prefix="source",
+        label="source data",
+    )
+    if source_path is not None:
+        _expect_equal("source.path", source_snapshot.path, _project_path(source_path))
     actual_rows = len(table_snapshot.frame)
     actual_columns = [str(column) for column in table_snapshot.frame.columns]
     _expect_equal("synthetic.rows", actual_rows, synthetic.get("rows"))
@@ -410,30 +812,42 @@ def _validate_common(
         generation.get("backend_seed"),
         TABDIFF_DETERMINISTIC_SEED,
     )
-    checkpoint_path = str(generation.get("checkpoint_path", "") or "")
-    if not checkpoint_path:
-        raise SyntheticProvenanceError(
-            "Synthetic provenance must record the exact checkpoint_path and checkpoint_sha256."
+    dependency_specs = (
+        ("metadata_path", "metadata_sha256", "prepared metadata"),
+        ("prepared_csv_path", "prepared_csv_sha256", "prepared training CSV"),
+        ("tabdiff_input_csv_path", "tabdiff_input_csv_sha256", "TabDiff input CSV"),
+        ("raw_samples_path", "raw_samples_sha256", "raw TabDiff samples"),
+        ("checkpoint_path", "checkpoint_sha256", "TabDiff checkpoint"),
+    )
+    dependency_snapshots = [
+        _capture_bound_dependency(
+            generation,
+            path_field=path_field,
+            sha256_field=sha256_field,
+            field_prefix="generation",
+            label=label,
         )
-    checkpoint_hash = _require_sha256(
-        generation.get("checkpoint_sha256"),
-        "generation.checkpoint_sha256",
+        for path_field, sha256_field, label in dependency_specs
+    ]
+    scientific_code_hash = _require_sha256(
+        generation.get("scientific_code_sha256"),
+        "generation.scientific_code_sha256",
     )
-    _require_sha256(
-        generation.get("prepared_csv_sha256"),
-        "generation.prepared_csv_sha256",
+    generation_protocol_hash = _require_sha256(
+        generation.get("protocol_sha256"),
+        "generation.protocol_sha256",
     )
-    _require_sha256(
-        generation.get("raw_samples_sha256"),
-        "generation.raw_samples_sha256",
-    )
-    checkpoint_snapshot: FileSnapshot | None = None
-    if Path(checkpoint_path).is_file():
-        checkpoint_snapshot = capture_file_snapshot(checkpoint_path)
+    if expected_scientific_code_sha256 is not None:
         _expect_equal(
-            "generation.checkpoint_sha256",
-            checkpoint_hash,
-            checkpoint_snapshot.sha256,
+            "generation.scientific_code_sha256",
+            scientific_code_hash,
+            _require_sha256(expected_scientific_code_sha256, "expected_scientific_code_sha256"),
+        )
+    if expected_generation_protocol_sha256 is not None:
+        _expect_equal(
+            "generation.protocol_sha256",
+            generation_protocol_hash,
+            _require_sha256(expected_generation_protocol_sha256, "expected_generation_protocol_sha256"),
         )
 
     current_config = generation_config_snapshot()
@@ -473,16 +887,20 @@ def _validate_common(
 
     assert_file_snapshot_current(table_snapshot.file, "synthetic data")
     assert_file_snapshot_current(sidecar_snapshot, "synthetic provenance")
-    if checkpoint_snapshot is not None:
-        assert_file_snapshot_current(checkpoint_snapshot, "TabDiff checkpoint")
+    assert_file_snapshot_current(source_snapshot, "source data")
+    for snapshot, (_, _, label) in zip(dependency_snapshots, dependency_specs, strict=True):
+        assert_file_snapshot_current(snapshot, label)
 
     return {
         "synthetic_path": str(resolved_synthetic),
         "provenance_path": str(sidecar_path),
+        "provenance_sha256": sidecar_snapshot.sha256,
         "synthetic_sha256": str(synthetic.get("sha256")),
         "source_sha256": str(source.get("sha256")),
         "combined_split_sha256": str(split.get("combined_sha256")),
         "generation_config_sha256": str(generation.get("config_sha256")),
+        "scientific_code_sha256": scientific_code_hash,
+        "generation_protocol_sha256": generation_protocol_hash,
     }
 
 
@@ -496,6 +914,8 @@ def validate_synthetic_provenance_for_runner(
     label_col: str | None = None,
     use_el_as_input: bool | None = None,
     validate_current_generation_config: bool = False,
+    expected_scientific_code_sha256: str | None = None,
+    expected_generation_protocol_sha256: str | None = None,
 ) -> dict[str, object]:
     """Validate runner source, split, and synthetic provenance."""
     import config
@@ -532,6 +952,7 @@ def validate_synthetic_provenance_for_runner(
     result = _validate_common(
         _project_path(synthetic_path),
         source_sha256=source_snapshot.file.sha256,
+        source_path=source_snapshot.file.path,
         split_seed=int(split_seed),
         split_method=str(split_method),
         generation_seed=int(generation_seed),
@@ -539,6 +960,8 @@ def validate_synthetic_provenance_for_runner(
         combined_split_sha256=combined_hash,
         schema_hash=schema_sha256([*feature_columns, label]),
         validate_current_generation_config=validate_current_generation_config,
+        expected_scientific_code_sha256=expected_scientific_code_sha256,
+        expected_generation_protocol_sha256=expected_generation_protocol_sha256,
     )
     assert_file_snapshot_current(source_snapshot.file, "source data")
     return result
@@ -550,11 +973,14 @@ def validate_synthetic_provenance_for_data_bundle(
     generation_seed: int,
     *,
     synthetic_snapshot: TableSnapshot | None = None,
+    expected_scientific_code_sha256: str | None = None,
+    expected_generation_protocol_sha256: str | None = None,
 ) -> dict[str, object]:
     """Validate immediately before loading synthetic samples for training."""
     return _validate_common(
         _project_path(synthetic_path),
         source_sha256=str(getattr(data_bundle, "source_sha256")),
+        source_path=getattr(data_bundle, "data_path", None),
         split_seed=int(getattr(data_bundle, "split_seed")),
         split_method=str(getattr(data_bundle, "split_method")),
         generation_seed=int(generation_seed),
@@ -563,4 +989,6 @@ def validate_synthetic_provenance_for_data_bundle(
         schema_hash=str(getattr(data_bundle, "schema_hash")),
         validate_current_generation_config=True,
         synthetic_snapshot=synthetic_snapshot,
+        expected_scientific_code_sha256=expected_scientific_code_sha256,
+        expected_generation_protocol_sha256=expected_generation_protocol_sha256,
     )

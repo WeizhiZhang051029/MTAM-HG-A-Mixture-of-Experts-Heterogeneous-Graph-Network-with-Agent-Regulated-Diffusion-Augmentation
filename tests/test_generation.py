@@ -17,6 +17,7 @@ import generation.prepare as prepare  # noqa: E402
 import generation.sample as sample  # noqa: E402
 import generation.train as generation_train  # noqa: E402
 from generation.tabdiff import (  # noqa: E402
+    base_train_command,
     checkpoint_output_snapshot,
     copy_latest_sample,
     find_fresh_checkpoint,
@@ -167,6 +168,7 @@ def test_tabdiff_commands_enable_official_deterministic_seed_zero(
     monkeypatch.setattr(prepare.config, "TABDIFF_GENERATION_SEED", 0, raising=False)
 
     assert "--deterministic" in train_command(tmp_path).command
+    assert "--deterministic" in base_train_command(tmp_path).command
     assert "--deterministic" in sample_command(tmp_path).command
 
     monkeypatch.setattr(prepare.config, "TABDIFF_GENERATION_SEED", 7, raising=False)
@@ -179,10 +181,13 @@ def test_tabdiff_training_reprocesses_even_when_outputs_exist(
     tmp_path: Path,
 ) -> None:
     commands: list[object] = []
+    monkeypatch.setattr(generation_train.config, "TABDIFF_CKPT_PATH", "", raising=False)
     monkeypatch.setattr(generation_train, "require_tabdiff_repo", lambda: tmp_path)
     monkeypatch.setattr(generation_train, "dataname", lambda: "capl_test")
     monkeypatch.setattr(generation_train, "process_command", lambda *_: "process")
-    monkeypatch.setattr(generation_train, "train_command", lambda *_: "train")
+    monkeypatch.setattr(generation_train, "base_train_command", lambda *_: "base")
+    monkeypatch.setattr(generation_train, "base_exp_name", lambda: "base_exp")
+    monkeypatch.setattr(generation_train, "train_command", lambda *_: "finetune")
     monkeypatch.setattr(generation_train, "processed_dataset_ready", lambda *_: True)
     monkeypatch.setattr(generation_train, "check_tabdiff_dependencies", lambda _: (True, "ok"))
     monkeypatch.setattr(generation_train, "tabdiff_remote", lambda _: "vendored")
@@ -198,8 +203,69 @@ def test_tabdiff_training_reprocesses_even_when_outputs_exist(
     result = generation_train.run_tabdiff_train(dry_run=False)
 
     assert result["processed_dataset_ready_before_process"] is True
-    assert commands == ["process", "train"]
+    assert commands == ["process", "base", "finetune"]
+    assert result["training_stages"] == ["base", "mechanism_finetune"]
+    assert result["base_checkpoint_path"] == str(checkpoint)
     assert result["checkpoint_path"] == str(checkpoint)
+
+
+def test_tabdiff_base_training_is_full_scope_without_finetune_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(prepare.config, "TABDIFF_GENERATION_SEED", 0, raising=False)
+
+    command = base_train_command(tmp_path, "capl_test").command
+
+    for flag in (
+        "--ckpt_path",
+        "--mechanism_constraint",
+        "--trainable_scope",
+        "--finetune_lr",
+        "--finetune_steps",
+        "--reset_train_epoch",
+    ):
+        assert flag not in command
+
+
+def test_tabdiff_external_checkpoint_skips_base_training(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(generation_train.config, "TABDIFF_CKPT_PATH", str(tmp_path / "base.pt"), raising=False)
+    monkeypatch.setattr(generation_train, "require_tabdiff_repo", lambda: tmp_path)
+    monkeypatch.setattr(generation_train, "dataname", lambda: "capl_test")
+    monkeypatch.setattr(generation_train, "process_command", lambda *_: "process")
+    monkeypatch.setattr(
+        generation_train,
+        "base_train_command",
+        lambda *_: pytest.fail("an external checkpoint must skip base training"),
+    )
+    monkeypatch.setattr(generation_train, "train_command", lambda *_: "finetune")
+    monkeypatch.setattr(generation_train, "processed_dataset_ready", lambda *_: True)
+    monkeypatch.setattr(generation_train, "check_tabdiff_dependencies", lambda _: (True, "ok"))
+    monkeypatch.setattr(generation_train, "tabdiff_remote", lambda _: "vendored")
+    monkeypatch.setattr(generation_train, "command_summary", lambda values: list(values))
+    monkeypatch.setattr(generation_train, "generation_seed", lambda: 0)
+
+    result = generation_train.run_tabdiff_train(dry_run=True)
+
+    assert result["commands"] == ["process", "finetune"]
+    assert result["training_stages"] == ["mechanism_finetune"]
+
+
+def test_tabdiff_mechanism_finetune_requires_the_selected_base_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(prepare.config, "TABDIFF_GENERATION_SEED", 0, raising=False)
+    checkpoint = (tmp_path / "base.pt").resolve()
+
+    command = train_command(tmp_path, "capl_test", checkpoint).command
+
+    assert Path(command[command.index("--ckpt_path") + 1]) == checkpoint
+    assert "--mechanism_constraint" in command
+    assert "--reset_train_epoch" in command
 
 
 def test_postprocess_writes_split_specific_provenance(
@@ -219,12 +285,15 @@ def test_postprocess_writes_split_specific_provenance(
     output_path = tmp_path / "synthetic.csv"
     checkpoint_path = tmp_path / "best_ema_model_current.pt"
     checkpoint_path.write_bytes(b"checkpoint")
+    monkeypatch.setattr(postprocess, "scientific_code_sha256", lambda: "a" * 64)
 
     result = postprocess.postprocess_tabdiff_samples(
         raw_path=raw_path,
         metadata_path=prepared["metadata_path"],
         output_path=output_path,
         checkpoint_path=checkpoint_path,
+        expected_scientific_code_sha256="a" * 64,
+        generation_protocol_sha256="b" * 64,
     )
     provenance = json.loads(Path(result["provenance_path"]).read_text(encoding="utf-8"))
 
@@ -234,7 +303,43 @@ def test_postprocess_writes_split_specific_provenance(
     assert provenance["generation"]["deterministic"] is True
     assert provenance["generation"]["checkpoint_path"] == str(checkpoint_path.resolve())
     assert provenance["generation"]["checkpoint_sha256"] == file_sha256(checkpoint_path)
+    assert provenance["generation"]["prepared_csv_path"] == str(Path(prepared["project_train_csv"]).resolve())
+    assert provenance["generation"]["raw_samples_path"] == str(raw_path.resolve())
+    assert provenance["generation"]["scientific_code_sha256"] == "a" * 64
+    assert provenance["generation"]["protocol_sha256"] == "b" * 64
     assert provenance["synthetic"]["sha256"] == file_sha256(output_path)
+
+
+def test_postprocess_rejects_scientific_code_change_before_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo_path, _ = _patch_io(monkeypatch, tmp_path, _source_table())
+    prepared = prepare.prepare_tabdiff_data(
+        data_path=tmp_path / "ignored.csv",
+        label_col="YS",
+        output_dir=tmp_path / "prepared",
+        repo_path=repo_path,
+        dataset_name="capl_test",
+    )
+    raw_path = tmp_path / "samples.csv"
+    pd.read_csv(prepared["project_train_csv"]).to_csv(raw_path, index=False)
+    checkpoint_path = tmp_path / "best_ema_model_current.pt"
+    checkpoint_path.write_bytes(b"checkpoint")
+    output_path = tmp_path / "synthetic.csv"
+    monkeypatch.setattr(postprocess, "scientific_code_sha256", lambda: "a" * 64)
+
+    with pytest.raises(RuntimeError, match="Scientific source code changed"):
+        postprocess.postprocess_tabdiff_samples(
+            raw_path=raw_path,
+            metadata_path=prepared["metadata_path"],
+            output_path=output_path,
+            checkpoint_path=checkpoint_path,
+            expected_scientific_code_sha256="b" * 64,
+            generation_protocol_sha256="c" * 64,
+        )
+
+    assert not output_path.exists()
 
 
 def test_sampling_rejects_checkpoint_mutation(

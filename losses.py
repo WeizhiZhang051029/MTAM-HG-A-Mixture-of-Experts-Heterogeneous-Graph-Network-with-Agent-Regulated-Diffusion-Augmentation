@@ -318,14 +318,22 @@ def total_loss(
     edge_mask: torch.Tensor | None = None,
     batch_weights: torch.Tensor | None = None,
     cluster_labels: torch.Tensor | None = None,
+    use_internal_agent_weight: bool | None = None,
+    use_agent_reward: bool | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the supervised training objective."""
     outputs = _as_output_dict(outputs)
+    configured_internal_agent_weight = (
+        bool(getattr(config, "AGENT_USE_SAMPLE_WEIGHT_FOR_SUPERVISED_LOSS", False))
+        or bool(getattr(config, "USE_CONFIDENCE_WEIGHTED_SUPERVISED_LOSS", False))
+    )
+    apply_internal_agent_weight = (
+        configured_internal_agent_weight
+        if use_internal_agent_weight is None
+        else bool(use_internal_agent_weight)
+    )
     if (
-        (
-            bool(getattr(config, "AGENT_USE_SAMPLE_WEIGHT_FOR_SUPERVISED_LOSS", False))
-            or bool(getattr(config, "USE_CONFIDENCE_WEIGHTED_SUPERVISED_LOSS", False))
-        )
+        apply_internal_agent_weight
         and "sample_confidence" in outputs
     ):
         agent_weight = outputs.get("training_weight", outputs["sample_confidence"])
@@ -341,7 +349,7 @@ def total_loss(
     expert_calib = torch.tensor(0.0, device=y.device)
     lambda_expert_calib = float(getattr(config, "EXPERT_CALIBRATION_LAMBDA", 0.0))
     if lambda_expert_calib > 0 and "expert_preds" in outputs:
-        expert_calib = expert_calibration_loss(outputs["expert_preds"], y, weights=batch_weights).to(y.device)
+        expert_calib = expert_calibration_loss(outputs["expert_preds"], y, weights=None).to(y.device)
         total = total + lambda_expert_calib * expert_calib
     diversity_loss = outputs.get("diversity_loss", torch.tensor(0.0, device=y.device))
     diversity_loss = diversity_loss.to(y.device) if torch.is_tensor(diversity_loss) else torch.tensor(0.0, device=y.device)
@@ -350,8 +358,13 @@ def total_loss(
         total = total + lambda_diversity * diversity_loss
     agent_reward_loss = torch.tensor(0.0, device=y.device)
     agent_logs: dict[str, float] = {}
-    if (
+    use_batch_agent_reward = (
         bool(getattr(config, "USE_AGENT_REWARD", False))
+        if use_agent_reward is None
+        else bool(use_agent_reward)
+    )
+    if (
+        use_batch_agent_reward
         and "sample_confidence" in outputs
         and "expert_preds" in outputs
         and "gate_probs" in outputs

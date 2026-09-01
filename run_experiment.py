@@ -6,9 +6,11 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +20,10 @@ from tqdm import tqdm
 from models.mr_lora import MR_LORA_SCOPE_FAMILIES
 from protocol import (
     BOOL_VALUE_FLAGS,
+    CONFIRMATORY_LOCKED_ARGS,
+    CONFIRMATORY_YAML_CANONICAL_SHA256,
     DEFAULT_BATCH_SIZE,
+    DEFAULT_CBTG_CROSS_RUN_VALIDATION_STD_PATH,
     DEFAULT_CLUSTER_BALANCE_LAMBDA,
     DEFAULT_CONFIG_PATH,
     DEFAULT_DATA_PATH,
@@ -69,6 +74,11 @@ from protocol import (
     DEFAULT_SEEDS,
     DEFAULT_SPLIT_METHOD,
     DEFAULT_SPLIT_SEED,
+    DEFAULT_SYNTHETIC_AGENT_ATTENTION_DIM,
+    DEFAULT_SYNTHETIC_AGENT_ATTENTION_HEADS,
+    DEFAULT_SYNTHETIC_AGENT_EPOCHS,
+    DEFAULT_SYNTHETIC_AGENT_HIDDEN_DIM,
+    DEFAULT_SYNTHETIC_AGENT_LR,
     DEFAULT_SYNTHETIC_CONFIDENCE_THRESHOLD,
     DEFAULT_SYNTHETIC_DATA_PATH,
     DEFAULT_SYNTHETIC_PRETRAIN_EPOCHS,
@@ -86,16 +96,46 @@ from protocol import (
     SUPERVISED_MAIN_TRAIN_MODE,
 )
 from protocol_integrity import (
+    ProtocolIntegrityError,
     SyntheticProvenanceError,
     assert_file_snapshot_current,
+    canonical_sha256,
     capture_file_snapshot,
     file_sha256,
+    scientific_code_sha256,
+    validate_cbtg_cross_run_validation_std,
     validate_synthetic_provenance_for_runner,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PAPER_METRICS = ("RMSE", "MAE", "MAPE", "R2", "TAIL_MAE")
-CONFIRMATORY_METRICS = PAPER_METRICS[:4]
+CONFIRMATORY_METRICS = PAPER_METRICS
+CBTG_VALIDATION_METRICS = ("RMSE", "MAE", "MAPE", "ONE_MINUS_R2", "TAIL_MAE")
+OPERATIONAL_YAML_KEYS = {
+    "model_seeds",
+    "output_base",
+    "tabdiff_repo_path",
+    "tabdiff_data_dir",
+    "tabdiff_output_dir",
+    "synthetic_data_path",
+    "cbtg_cross_run_validation_std_path",
+}
+OPERATIONAL_RUNTIME_KEYS = {
+    "PROJECT_ROOT",
+    "DATA_PATH",
+    "SYNTHETIC_DATA_PATH",
+    "CBTG_CROSS_RUN_VALIDATION_STD_PATH",
+    "OUTPUT_DIR",
+    "CHECKPOINT_DIR",
+    "LOG_DIR",
+    "RESULT_DIR",
+    "SCALER_PATH",
+    "TABDIFF_REPO_PATH",
+    "TABDIFF_DATA_DIR",
+    "TABDIFF_OUTPUT_DIR",
+    "DEVICE",
+    "TABDIFF_GPU",
+}
 METRICS_INTEGRITY_FIELDS = (
     "Split_Seed",
     "Split_Method",
@@ -104,6 +144,9 @@ METRICS_INTEGRITY_FIELDS = (
     "Synthetic_SHA256",
     "Generation_Seed",
     "Config_SHA256",
+    "Effective_Protocol_SHA256",
+    "CBTG_Cross_Run_Validation_STD_SHA256",
+    "Synthetic_Provenance_SHA256",
 )
 
 
@@ -139,16 +182,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generation_seed", type=int, default=DEFAULT_GENERATION_SEED)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--synthetic_pretrain_epochs", type=int, default=DEFAULT_SYNTHETIC_PRETRAIN_EPOCHS)
-    parser.add_argument("--synthetic_agent_epochs", type=int, default=None)
-    parser.add_argument("--synthetic_agent_lr", type=float, default=None)
-    parser.add_argument("--synthetic_agent_hidden_dim", type=int, default=None)
-    parser.add_argument("--synthetic_agent_attention_dim", type=int, default=None)
-    parser.add_argument("--synthetic_agent_attention_heads", type=int, default=None)
+    parser.add_argument("--synthetic_agent_epochs", type=int, default=DEFAULT_SYNTHETIC_AGENT_EPOCHS)
+    parser.add_argument("--synthetic_agent_lr", type=float, default=DEFAULT_SYNTHETIC_AGENT_LR)
+    parser.add_argument("--synthetic_agent_hidden_dim", type=int, default=DEFAULT_SYNTHETIC_AGENT_HIDDEN_DIM)
+    parser.add_argument("--synthetic_agent_attention_dim", type=int, default=DEFAULT_SYNTHETIC_AGENT_ATTENTION_DIM)
+    parser.add_argument("--synthetic_agent_attention_heads", type=int, default=DEFAULT_SYNTHETIC_AGENT_ATTENTION_HEADS)
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--agent_dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--synthetic_agent_dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--synthetic_confidence_threshold", type=float, default=DEFAULT_SYNTHETIC_CONFIDENCE_THRESHOLD)
-    parser.add_argument("--synthetic_pretrain_confidence_threshold", type=float, default=None)
+    parser.add_argument("--synthetic_pretrain_confidence_threshold", type=float, default=0.0)
     parser.add_argument("--use_dynamic_synthetic_agent", action="store_true", default=DEFAULT_USE_DYNAMIC_SYNTHETIC_AGENT)
     parser.add_argument("--no_dynamic_synthetic_agent", dest="use_dynamic_synthetic_agent", action="store_false")
     parser.add_argument("--dynamic_synthetic_refresh_epochs", type=int, default=DEFAULT_DYNAMIC_SYNTHETIC_REFRESH_EPOCHS)
@@ -219,6 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tabdiff_num_samples", type=int, default=None)
     parser.add_argument("--tabdiff_gpu", type=int, default=None)
     parser.add_argument(
+        "--cbtg_cross_run_validation_std_path",
+        default=DEFAULT_CBTG_CROSS_RUN_VALIDATION_STD_PATH,
+    )
+    parser.add_argument(
         "--skip_tabdiff_generation",
         action="store_true",
         help="Skip the TabDiff generation phase even when --synthetic_data_path is missing.",
@@ -228,11 +275,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if list(args.seeds) != DEFAULT_SEEDS:
-        raise ValueError(
-            "The confirmatory run requires the ten model seeds "
-            f"{DEFAULT_SEEDS} in this exact order; got {list(args.seeds)}."
-        )
+    selected_seeds = [int(seed) for seed in args.seeds]
+    if len(selected_seeds) != 10 or len(set(selected_seeds)) != 10:
+        raise ValueError("The confirmatory run requires ten distinct model seeds.")
     if int(args.split_seed) != DEFAULT_SPLIT_SEED:
         raise ValueError(
             f"The confirmatory split seed is fixed at {DEFAULT_SPLIT_SEED}; got {args.split_seed}."
@@ -249,6 +294,20 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.main_experiment_name not in {"", SUPERVISED_MAIN_EXPERIMENT_NAME}:
         raise ValueError(f"--main_experiment_name must be {SUPERVISED_MAIN_EXPERIMENT_NAME!r}.")
+    if args.label_col != DEFAULT_LABEL_COL:
+        raise ValueError(f"The confirmatory label column is fixed at {DEFAULT_LABEL_COL!r}.")
+    for name, expected in CONFIRMATORY_LOCKED_ARGS.items():
+        actual = getattr(args, name)
+        if actual != expected:
+            raise ValueError(
+                f"The confirmatory value for --{name} is fixed at {expected!r}; got {actual!r}."
+            )
+    if args.tabdiff_num_samples is not None and int(args.tabdiff_num_samples) != DEFAULT_TABDIFF_NUM_SAMPLES:
+        raise ValueError(
+            f"The confirmatory value for --tabdiff_num_samples is fixed at {DEFAULT_TABDIFF_NUM_SAMPLES}."
+        )
+    if not str(args.cbtg_cross_run_validation_std_path).strip():
+        raise ValueError("--cbtg_cross_run_validation_std_path is required.")
     positive_ints = {
         "epochs": args.epochs,
         "synthetic_pretrain_epochs": args.synthetic_pretrain_epochs,
@@ -542,7 +601,13 @@ def seed_template_path(template: str, seed: int) -> str:
     return str(path / f"seed_{seed}")
 
 
-def build_tabdiff_generation_command(args: argparse.Namespace, tabdiff_num_samples: int) -> list[str]:
+def build_tabdiff_generation_command(
+    args: argparse.Namespace,
+    tabdiff_num_samples: int,
+    *,
+    scientific_code_hash: str | None = None,
+    generation_protocol_hash: str | None = None,
+) -> list[str]:
     cmd = [
         sys.executable,
         "pipeline.py",
@@ -571,6 +636,17 @@ def build_tabdiff_generation_command(args: argparse.Namespace, tabdiff_num_sampl
     ]
     if args.tabdiff_gpu is not None:
         cmd.extend(["--tabdiff_gpu", str(args.tabdiff_gpu)])
+    if (scientific_code_hash is None) != (generation_protocol_hash is None):
+        raise ValueError("Scientific code and generation protocol hashes must be provided together.")
+    if scientific_code_hash is not None and generation_protocol_hash is not None:
+        cmd.extend(
+            [
+                "--scientific_code_sha256",
+                _sha256_value(scientific_code_hash, "scientific code"),
+                "--generation_protocol_sha256",
+                _sha256_value(generation_protocol_hash, "generation protocol"),
+            ]
+        )
     return cmd
 
 
@@ -581,6 +657,8 @@ def build_main_train_command(
     synthetic_path: str,
     tabdiff_num_samples: int,
     experiment_name: str | None = None,
+    scientific_code_hash: str | None = None,
+    generation_protocol_hash: str | None = None,
 ) -> list[str]:
     resolved_experiment_name = experiment_name or args.main_experiment_name or SUPERVISED_MAIN_EXPERIMENT_NAME
     cmd = [
@@ -637,6 +715,17 @@ def build_main_train_command(
         cmd = append_optional_cli_args(cmd, args, mr_lora_value_specs)
         if args.mr_lora_train_output_head:
             cmd.append("--mr_lora_train_output_head")
+    if (scientific_code_hash is None) != (generation_protocol_hash is None):
+        raise ValueError("Scientific code and generation protocol hashes must be provided together.")
+    if scientific_code_hash is not None and generation_protocol_hash is not None:
+        cmd.extend(
+            [
+                "--scientific_code_sha256",
+                _sha256_value(scientific_code_hash, "scientific code"),
+                "--generation_protocol_sha256",
+                _sha256_value(generation_protocol_hash, "generation protocol"),
+            ]
+        )
     return cmd
 
 
@@ -665,6 +754,178 @@ def _sha256_value(value: object, field: str) -> str:
     return text.lower()
 
 
+def effective_protocol_snapshot(
+    config_values: dict[str, object],
+    args: argparse.Namespace,
+    tabdiff_num_samples: int,
+    cross_run_statistics: dict[str, object],
+    runtime_config_values: dict[str, object] | None = None,
+    producer_protocol_hash: str | None = None,
+    producer_protocol: dict[str, object] | None = None,
+) -> dict[str, object]:
+    runner = dict(vars(args))
+    runner["seeds"] = [int(seed) for seed in args.seeds]
+    runner["tabdiff_num_samples"] = int(tabdiff_num_samples)
+    runner["main_experiment_name"] = args.main_experiment_name or SUPERVISED_MAIN_EXPERIMENT_NAME
+    return {
+        "format": "mtam_hg_effective_protocol_v1",
+        "yaml": config_values,
+        "runner": runner,
+        "runtime": {
+            "mode": SUPERVISED_MAIN_TRAIN_MODE,
+            "model": MAIN_EXPERIMENT_MODEL,
+            "use_el_as_input": False,
+            "use_laplace": False,
+            "shared_split": True,
+            "config": runtime_config_values or {},
+        },
+        "cbtg_producer_protocol_sha256": (
+            _sha256_value(producer_protocol_hash, "CBTG producer protocol")
+            if producer_protocol_hash is not None
+            else None
+        ),
+        "cbtg_producer_protocol": producer_protocol,
+        "cbtg_cross_run_validation_std": {
+            "sha256": _sha256_value(cross_run_statistics.get("sha256"), "cross-run statistics"),
+            "payload": cross_run_statistics.get("payload"),
+        },
+    }
+
+
+def effective_protocol_sha256(snapshot: dict[str, object]) -> str:
+    return canonical_sha256(snapshot)
+
+
+def scientific_producer_protocol_snapshot(
+    config_values: dict[str, object],
+    args: argparse.Namespace,
+    tabdiff_num_samples: int,
+    runtime_config_values: dict[str, object],
+    code_sha256: str,
+) -> dict[str, object]:
+    yaml_values = {
+        key: value
+        for key, value in config_values.items()
+        if key not in OPERATIONAL_YAML_KEYS
+    }
+    runner_values = {
+        name: getattr(args, name)
+        for name in sorted(CONFIRMATORY_LOCKED_ARGS)
+    }
+    runner_values.update(
+        {
+            "split_seed": int(args.split_seed),
+            "split_method": str(args.split_method),
+            "generation_seed": int(args.generation_seed),
+            "label_col": str(args.label_col),
+            "tabdiff_num_samples": int(tabdiff_num_samples),
+            "main_experiment_name": args.main_experiment_name or SUPERVISED_MAIN_EXPERIMENT_NAME,
+        }
+    )
+    runtime_values = {
+        key: value
+        for key, value in runtime_config_values.items()
+        if key not in OPERATIONAL_RUNTIME_KEYS
+    }
+    return {
+        "format": "mtam_hg_cbtg_producer_protocol_v1",
+        "yaml": yaml_values,
+        "runner": runner_values,
+        "runtime": runtime_values,
+        "validation_metrics": list(CBTG_VALIDATION_METRICS),
+        "validation_std_ddof": 1,
+        "code_sha256": _sha256_value(code_sha256, "scientific code"),
+    }
+
+
+def scientific_producer_protocol_sha256(snapshot: dict[str, object]) -> str:
+    return canonical_sha256(snapshot)
+
+
+def require_scientific_code_sha256(expected_sha256: str) -> None:
+    if scientific_code_sha256() != expected_sha256:
+        raise RuntimeError("Scientific source code changed during the confirmatory run.")
+
+
+def _protocol_value(value: object) -> object:
+    if isinstance(value, Path):
+        try:
+            return value.resolve().relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            return str(value)
+    if isinstance(value, dict):
+        return {str(key): _protocol_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_protocol_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise TypeError
+
+
+def runtime_config_snapshot(runtime_config: object) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for name in sorted(name for name in dir(runtime_config) if name.isupper()):
+        if name == "CONFIG_SHA256":
+            continue
+        try:
+            snapshot[name] = _protocol_value(getattr(runtime_config, name))
+        except TypeError:
+            continue
+    return snapshot
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def bind_metrics_to_effective_protocol(
+    metrics_path: Path,
+    expected_seed: int,
+    expected_integrity: dict[str, object],
+) -> str:
+    snapshot = capture_file_snapshot(metrics_path, include_content=True)
+    assert snapshot.content is not None
+    metrics = json.loads(snapshot.content.decode("utf-8"))
+    if not isinstance(metrics, dict):
+        raise ValueError(f"Metrics root must be an object: {metrics_path}")
+    if metrics.get("Seed") != expected_seed:
+        raise ValueError(f"Metrics seed mismatch: {metrics_path}")
+    binding_fields = {"Effective_Protocol_SHA256"}
+    mismatched = [
+        field
+        for field in METRICS_INTEGRITY_FIELDS
+        if field not in binding_fields and metrics.get(field) != expected_integrity.get(field)
+    ]
+    if mismatched:
+        raise ValueError(f"Metrics protocol integrity mismatch at {metrics_path}: {', '.join(mismatched)}.")
+    for field in binding_fields:
+        existing = metrics.get(field)
+        if existing is not None and existing != expected_integrity.get(field):
+            raise ValueError(f"Metrics protocol integrity mismatch at {metrics_path}: {field}.")
+        metrics[field] = expected_integrity[field]
+    assert_file_snapshot_current(snapshot, "metrics artifact")
+    _write_json_atomic(metrics_path, metrics)
+    return file_sha256(metrics_path)
+
+
 def require_file_sha256(path: Path, expected_sha256: str, label: str) -> None:
     if file_sha256(path) != expected_sha256:
         raise RuntimeError(f"{label} changed during the confirmatory run: {path}")
@@ -678,24 +939,8 @@ def require_loaded_config_sha256(expected_sha256: str) -> None:
 
 
 def validate_declared_protocol(config_values: dict[str, object]) -> None:
-    try:
-        model_seeds = [int(seed) for seed in config_values.get("model_seeds", [])]
-        declared_protocol = {
-            "model_seeds": model_seeds,
-            "split_seed": int(config_values.get("split_seed", -1)),
-            "split_method": str(config_values.get("split_method", "")),
-            "generation_seed": int(config_values.get("generation_seed", -1)),
-        }
-    except (TypeError, ValueError) as exc:
-        raise ValueError("YAML protocol is incomplete or invalid.") from exc
-    expected_protocol = {
-        "model_seeds": list(DEFAULT_SEEDS),
-        "split_seed": DEFAULT_SPLIT_SEED,
-        "split_method": DEFAULT_SPLIT_METHOD,
-        "generation_seed": DEFAULT_GENERATION_SEED,
-    }
-    if declared_protocol != expected_protocol:
-        raise ValueError("YAML protocol does not match the locked confirmatory protocol.")
+    if canonical_sha256(config_values) != CONFIRMATORY_YAML_CANONICAL_SHA256:
+        raise ValueError("YAML configuration does not match the locked confirmatory protocol.")
 
 
 def metrics_integrity_fields(
@@ -704,6 +949,8 @@ def metrics_integrity_fields(
     split_method: str,
     generation_seed: int,
     config_sha256: str,
+    effective_protocol_hash: str,
+    cross_run_statistics_sha256: str,
 ) -> dict[str, object]:
     return {
         "Split_Seed": int(split_seed),
@@ -715,6 +962,15 @@ def metrics_integrity_fields(
         "Synthetic_SHA256": _sha256_value(provenance.get("synthetic_sha256"), "synthetic_sha256"),
         "Generation_Seed": int(generation_seed),
         "Config_SHA256": _sha256_value(config_sha256, "config_sha256"),
+        "Effective_Protocol_SHA256": _sha256_value(
+            effective_protocol_hash, "effective_protocol_sha256"
+        ),
+        "CBTG_Cross_Run_Validation_STD_SHA256": _sha256_value(
+            cross_run_statistics_sha256, "cross_run_statistics_sha256"
+        ),
+        "Synthetic_Provenance_SHA256": _sha256_value(
+            provenance.get("provenance_sha256"), "synthetic_provenance_sha256"
+        ),
     }
 
 
@@ -725,8 +981,13 @@ def validate_runner_integrity(
     split_method: str,
     generation_seed: int,
     config_sha256: str,
+    effective_protocol_hash: str,
+    producer_protocol_hash: str,
+    cross_run_statistics_path: Path,
+    cross_run_statistics_sha256: str,
     *,
     label_col: str,
+    scientific_code_hash: str,
     expected_fields: dict[str, object] | None = None,
 ) -> dict[str, object]:
     provenance = validate_synthetic_provenance_for_runner(
@@ -738,13 +999,26 @@ def validate_runner_integrity(
         label_col=label_col,
         use_el_as_input=False,
         validate_current_generation_config=True,
+        expected_scientific_code_sha256=scientific_code_hash,
+        expected_generation_protocol_sha256=producer_protocol_hash,
     )
+    cross_run_statistics = validate_cbtg_cross_run_validation_std(
+        cross_run_statistics_path,
+        expected_split_sha256=str(provenance["combined_split_sha256"]),
+        expected_source_data_sha256=str(provenance["source_sha256"]),
+        expected_config_sha256=config_sha256,
+        expected_producer_protocol_sha256=producer_protocol_hash,
+    )
+    if cross_run_statistics["sha256"] != cross_run_statistics_sha256:
+        raise RuntimeError("CBTG cross-run statistics changed during execution.")
     current_fields = metrics_integrity_fields(
         provenance,
         split_seed,
         split_method,
         generation_seed,
         config_sha256,
+        effective_protocol_hash,
+        cross_run_statistics_sha256,
     )
     if expected_fields is not None:
         mismatched = [field for field in METRICS_INTEGRITY_FIELDS if current_fields.get(field) != expected_fields.get(field)]
@@ -812,10 +1086,16 @@ def require_fresh_seed_metrics(
             f"seed {expected_seed} produced {len(fresh_paths)} under {run_dir}."
         )
     metrics_path = fresh_paths[0]
+    bound_sha256 = bind_metrics_to_effective_protocol(
+        metrics_path,
+        expected_seed,
+        expected_integrity,
+    )
     loaded = load_seed_metrics(
         metrics_path,
         expected_seed=expected_seed,
         expected_integrity=expected_integrity,
+        expected_sha256=bound_sha256,
     )
     return metrics_path, str(loaded["metrics_sha256"])
 
@@ -879,30 +1159,36 @@ def write_runner_summary(
     seed_metrics_paths: dict[int, Path] | None = None,
     seed_metrics_sha256: dict[int, str] | None = None,
     integrity_fields: dict[str, object] | None = None,
+    effective_protocol: dict[str, object] | None = None,
+    effective_protocol_hash: str | None = None,
 ) -> Path:
     if int(split_seed) != DEFAULT_SPLIT_SEED or split_method != DEFAULT_SPLIT_METHOD:
         raise ValueError("Summary protocol does not match the locked confirmatory split.")
     if int(generation_seed) != DEFAULT_GENERATION_SEED:
         raise ValueError("Summary protocol does not match the locked confirmatory generation seed.")
-    if not dry_run and list(seed_run_dirs) != DEFAULT_SEEDS:
-        raise ValueError(
-            "A non-dry-run confirmatory summary requires exactly the ten ordered model seeds "
-            f"{DEFAULT_SEEDS}; got {list(seed_run_dirs)}."
-        )
-    if not dry_run and (seed_metrics_paths is None or list(seed_metrics_paths) != DEFAULT_SEEDS):
+    ordered_seeds = list(seed_run_dirs)
+    if not dry_run and len(ordered_seeds) != 10:
+        raise ValueError("A non-dry-run confirmatory summary requires ten distinct model seeds.")
+    if not dry_run and (seed_metrics_paths is None or list(seed_metrics_paths) != ordered_seeds):
         received = [] if seed_metrics_paths is None else list(seed_metrics_paths)
         raise ValueError(
             "A non-dry-run confirmatory summary requires one exact current-run metrics path for each seed "
-            f"{DEFAULT_SEEDS}; got {received}."
+            f"{ordered_seeds}; got {received}."
         )
-    if not dry_run and (seed_metrics_sha256 is None or list(seed_metrics_sha256) != DEFAULT_SEEDS):
+    if not dry_run and (seed_metrics_sha256 is None or list(seed_metrics_sha256) != ordered_seeds):
         received = [] if seed_metrics_sha256 is None else list(seed_metrics_sha256)
         raise ValueError(
             "A non-dry-run confirmatory summary requires one locked metrics hash for each seed "
-            f"{DEFAULT_SEEDS}; got {received}."
+            f"{ordered_seeds}; got {received}."
         )
     if not dry_run and integrity_fields is None:
         raise ValueError("A non-dry-run confirmatory summary requires validated integrity fields.")
+    if not dry_run and (effective_protocol is None or effective_protocol_hash is None):
+        raise ValueError("A non-dry-run confirmatory summary requires the effective protocol.")
+    if effective_protocol is not None:
+        calculated_hash = effective_protocol_sha256(effective_protocol)
+        if calculated_hash != effective_protocol_hash:
+            raise ValueError("Effective protocol hash mismatch.")
     if integrity_fields is not None:
         missing_fields = [field for field in METRICS_INTEGRITY_FIELDS if field not in integrity_fields]
         if missing_fields:
@@ -912,16 +1198,20 @@ def write_runner_summary(
                 "combined_split_sha256": integrity_fields["Combined_Split_SHA256"],
                 "source_sha256": integrity_fields["Source_Data_SHA256"],
                 "synthetic_sha256": integrity_fields["Synthetic_SHA256"],
+                "provenance_sha256": integrity_fields["Synthetic_Provenance_SHA256"],
             },
             split_seed,
             split_method,
             generation_seed,
             str(integrity_fields["Config_SHA256"]),
+            str(integrity_fields["Effective_Protocol_SHA256"]),
+            str(integrity_fields["CBTG_Cross_Run_Validation_STD_SHA256"]),
         )
         if any(integrity_fields[field] != normalized_integrity[field] for field in METRICS_INTEGRITY_FIELDS):
             raise ValueError("Summary integrity fields do not match the locked run protocol.")
+        if effective_protocol_hash != integrity_fields["Effective_Protocol_SHA256"]:
+            raise ValueError("Summary effective protocol does not match the seed metrics.")
         integrity_fields = normalized_integrity
-    ordered_seeds = DEFAULT_SEEDS if not dry_run else list(seed_run_dirs)
     seeds = [
         _summary_seed_entry(
             seed,
@@ -951,7 +1241,7 @@ def write_runner_summary(
         aggregate[metric] = {"mean": mean, "std": std, "n": len(values), "ddof": 1}
     if not dry_run:
         for metric in CONFIRMATORY_METRICS:
-            if aggregate.get(metric, {}).get("n") != len(DEFAULT_SEEDS):
+            if aggregate.get(metric, {}).get("n") != 10:
                 raise ValueError(
                     f"Confirmatory metric {metric} must contain ten finite values; got {aggregate.get(metric)}."
                 )
@@ -969,13 +1259,16 @@ def write_runner_summary(
     summary = {
         "dry_run": bool(dry_run),
         "main_train_mode": SUPERVISED_MAIN_TRAIN_MODE,
-        "evaluation_protocol": "confirmatory_fixed_seed",
-        "model_seeds": list(DEFAULT_SEEDS),
+        "evaluation_protocol": "confirmatory_dry_run" if dry_run else "confirmatory_fixed_seed",
+        "model_seeds": ordered_seeds,
         "split_seed": int(split_seed),
         "split_method": split_method,
         "generation_seed": int(generation_seed),
+        "effective_protocol_sha256": effective_protocol_hash,
+        "effective_protocol": effective_protocol,
         "confirmatory_protocol": {
-            "model_seeds": list(DEFAULT_SEEDS),
+            "validated": bool(not dry_run and integrity_fields is not None),
+            "model_seeds": ordered_seeds,
             "split_seed": int(split_seed),
             "split_method": split_method,
             "generation_seed": int(generation_seed),
@@ -990,7 +1283,7 @@ def write_runner_summary(
         "dynamic_synthetic_contract": (
             "When enabled, the Agent receives dynamic main-model feedback features during synthetic pretraining "
             "including K-means working-condition cluster difficulty, and its feedback-conditioned policy score drives synthetic-sample loss weights and expected sampling quota; "
-            "final real fine-tuning remains supervised on real training rows only."
+            "the predictor is calibrated on real training rows and the Agent is calibrated from real validation feedback."
         ),
         "phases": phases,
         "seeds": seeds,
@@ -1060,7 +1353,45 @@ def main() -> None:
     runtime_config.TABDIFF_NUM_SAMPLES = tabdiff_num_samples
     runtime_config.LABEL_COL = args.label_col
     runtime_config.USE_EL_AS_INPUT = False
+    runtime_config.USE_LAPLACE = False
+    runtime_config.CBTG_CROSS_RUN_VALIDATION_STD_PATH = args.cbtg_cross_run_validation_std_path
     runtime_config.CONFIG_SHA256 = config_sha256
+    runtime_values = runtime_config_snapshot(runtime_config)
+    code_sha256 = scientific_code_sha256()
+    producer_protocol = scientific_producer_protocol_snapshot(
+        config_values,
+        args,
+        tabdiff_num_samples,
+        runtime_values,
+        code_sha256,
+    )
+    producer_protocol_hash = scientific_producer_protocol_sha256(producer_protocol)
+    cross_run_statistics_path = project_path(args.cbtg_cross_run_validation_std_path)
+    try:
+        cross_run_statistics = validate_cbtg_cross_run_validation_std(
+            cross_run_statistics_path,
+            expected_config_sha256=config_sha256,
+            expected_producer_protocol_sha256=producer_protocol_hash,
+        )
+    except ProtocolIntegrityError:
+        if not args.dry_run:
+            raise
+        cross_run_statistics = {
+            "path": str(cross_run_statistics_path),
+            "sha256": "0" * 64,
+            "payload": {"status": "required_for_confirmatory_execution"},
+        }
+    cross_run_statistics_sha256 = str(cross_run_statistics["sha256"])
+    protocol_snapshot = effective_protocol_snapshot(
+        config_values,
+        args,
+        tabdiff_num_samples,
+        cross_run_statistics,
+        runtime_values,
+        producer_protocol_hash,
+        producer_protocol,
+    )
+    protocol_hash = effective_protocol_sha256(protocol_snapshot)
     synthetic_path = PROJECT_ROOT / args.synthetic_data_path
     if "smoke" in synthetic_path.name.lower():
         raise ValueError("The released experiment must not use smoke synthetic data.")
@@ -1139,9 +1470,10 @@ def main() -> None:
     print(f"  tabdiff_generation={not args.skip_tabdiff_generation}", flush=True)
     print(f"  generation_seed={args.generation_seed}", flush=True)
     require_file_sha256(config_path, config_sha256, "Experiment config")
+    require_scientific_code_sha256(code_sha256)
 
     needs_generation = not synthetic_path.exists()
-    if synthetic_path.exists():
+    if synthetic_path.exists() and not args.dry_run:
         try:
             initial_integrity = validate_runner_integrity(
                 synthetic_path,
@@ -1150,7 +1482,12 @@ def main() -> None:
                 args.split_method,
                 args.generation_seed,
                 config_sha256,
+                protocol_hash,
+                producer_protocol_hash,
+                cross_run_statistics_path,
+                cross_run_statistics_sha256,
                 label_col=args.label_col,
+                scientific_code_hash=code_sha256,
             )
         except SyntheticProvenanceError:
             if args.skip_tabdiff_generation:
@@ -1160,7 +1497,12 @@ def main() -> None:
     if needs_generation and not args.skip_tabdiff_generation:
         phase = ExperimentPhase(
             name="tabdiff-generate",
-            command=build_tabdiff_generation_command(args, tabdiff_num_samples),
+            command=build_tabdiff_generation_command(
+                args,
+                tabdiff_num_samples,
+                scientific_code_hash=code_sha256,
+                generation_protocol_hash=producer_protocol_hash,
+            ),
             run_dir=output_root / "tabdiff_generation",
             output_path=synthetic_path,
         )
@@ -1168,6 +1510,7 @@ def main() -> None:
         run_phase(phase, args.dry_run)
         if not args.dry_run:
             require_file_sha256(config_path, config_sha256, "Experiment config")
+            require_scientific_code_sha256(code_sha256)
             initial_integrity = validate_runner_integrity(
                 synthetic_path,
                 project_path(args.data_path),
@@ -1175,12 +1518,20 @@ def main() -> None:
                 args.split_method,
                 args.generation_seed,
                 config_sha256,
+                protocol_hash,
+                producer_protocol_hash,
+                cross_run_statistics_path,
+                cross_run_statistics_sha256,
                 label_col=args.label_col,
+                scientific_code_hash=code_sha256,
             )
     elif needs_generation and args.skip_tabdiff_generation:
-        raise FileNotFoundError(
-            f"Synthetic data file is missing and --skip_tabdiff_generation was set: {synthetic_path}"
-        )
+        if args.dry_run:
+            tqdm.write(f"[dry-run:skip-tabdiff-generate] missing synthetic file: {synthetic_path}", file=sys.stdout)
+        else:
+            raise FileNotFoundError(
+                f"Synthetic data file is missing and --skip_tabdiff_generation was set: {synthetic_path}"
+            )
     else:
         tqdm.write(f"[skip:tabdiff-generate] existing synthetic file: {synthetic_path}", file=sys.stdout)
 
@@ -1192,6 +1543,7 @@ def main() -> None:
             previous_metrics = {}
         else:
             require_file_sha256(config_path, config_sha256, "Experiment config")
+            require_scientific_code_sha256(code_sha256)
             if initial_integrity is None:
                 raise RuntimeError("Initial run integrity was not validated.")
             validate_runner_integrity(
@@ -1201,14 +1553,27 @@ def main() -> None:
                 args.split_method,
                 args.generation_seed,
                 config_sha256,
+                protocol_hash,
+                producer_protocol_hash,
+                cross_run_statistics_path,
+                cross_run_statistics_sha256,
                 label_col=args.label_col,
+                scientific_code_hash=code_sha256,
                 expected_fields=initial_integrity,
             )
             previous_metrics = metrics_output_snapshot(run_dir)
 
         phase = ExperimentPhase(
             name=f"seed {seed} main-train",
-            command=build_main_train_command(args, seed, run_dir, final_synthetic_path, tabdiff_num_samples),
+            command=build_main_train_command(
+                args,
+                seed,
+                run_dir,
+                final_synthetic_path,
+                tabdiff_num_samples,
+                scientific_code_hash=code_sha256,
+                generation_protocol_hash=producer_protocol_hash,
+            ),
             run_dir=run_dir,
             output_path=run_dir / "results" / "metrics.json",
         )
@@ -1217,6 +1582,7 @@ def main() -> None:
         run_phase(phase, args.dry_run)
         if not args.dry_run:
             require_file_sha256(config_path, config_sha256, "Experiment config")
+            require_scientific_code_sha256(code_sha256)
             assert initial_integrity is not None
             validate_runner_integrity(
                 synthetic_path,
@@ -1225,7 +1591,12 @@ def main() -> None:
                 args.split_method,
                 args.generation_seed,
                 config_sha256,
+                protocol_hash,
+                producer_protocol_hash,
+                cross_run_statistics_path,
+                cross_run_statistics_sha256,
                 label_col=args.label_col,
+                scientific_code_hash=code_sha256,
                 expected_fields=initial_integrity,
             )
             fresh_metrics, fresh_metrics_sha256 = require_fresh_seed_metrics(
@@ -1251,6 +1622,8 @@ def main() -> None:
         seed_metrics_paths=None if args.dry_run else seed_metrics_paths,
         seed_metrics_sha256=None if args.dry_run else seed_metrics_sha256,
         integrity_fields=initial_integrity,
+        effective_protocol=protocol_snapshot,
+        effective_protocol_hash=protocol_hash,
     )
     print(f"\n[done] Main experiment outputs: {output_root}", flush=True)
     print(f"[done] Runner summary: {summary_path}", flush=True)

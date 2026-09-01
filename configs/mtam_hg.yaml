@@ -35,8 +35,9 @@ synthetic_agent_hidden_dim: 128
 synthetic_agent_attention_dim: 64
 synthetic_agent_attention_heads: 4
 synthetic_agent_dropout: 0.2
-synthetic_agent_epochs: 20
+synthetic_agent_epochs: 100
 synthetic_agent_lr: 0.001
+cbtg_cross_run_validation_std_path: data/cbtg_cross_run_validation_std.json
 synthetic_pretrain_confidence_threshold: 0.0
 use_dynamic_synthetic_agent: true
 dynamic_synthetic_refresh_epochs: 5
@@ -92,9 +93,9 @@ cli:
   agent_use_uncertainty: true
   agent_output_sample_confidence: true
   agent_reliability_routing_lambda: 1.0
-  use_agent_reward: true
+  use_agent_reward: false
   agent_reward_lambda: 0.01
   target_confidence_mean: 0.6
   confidence_mean_reg_lambda: 0.01
   confidence_entropy_reg_lambda: 0.001
-  use_confidence_weighted_supervised_loss: true
+  use_confidence_weighted_supervised_loss: false

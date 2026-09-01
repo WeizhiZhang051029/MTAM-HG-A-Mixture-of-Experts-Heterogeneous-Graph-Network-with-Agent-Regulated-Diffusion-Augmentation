@@ -19,17 +19,23 @@ import training.cbtg as cbtg  # noqa: E402
 from dataset import _split_indices, create_dataloaders  # noqa: E402
 from generation.prepare import PAPER_FEATURE_KEYS  # noqa: E402
 from protocol_integrity import (  # noqa: E402
+    CBTG_CROSS_RUN_DDOF,
+    CBTG_CROSS_RUN_FORMAT,
+    CBTG_CROSS_RUN_METRICS,
     PROVENANCE_FORMAT,
     FileMutationError,
+    ProtocolIntegrityError,
     SyntheticProvenanceError,
     assert_file_snapshot_current,
     canonical_sha256,
     file_sha256,
     generation_config_snapshot,
+    produce_cbtg_cross_run_validation_std,
     read_table_snapshot,
     schema_sha256,
     split_fingerprints,
     synthetic_provenance_path,
+    validate_cbtg_cross_run_validation_std,
     validate_synthetic_provenance_for_data_bundle,
     validate_synthetic_provenance_for_runner,
 )
@@ -63,6 +69,14 @@ def _write_valid_artifacts(tmp_path: Path) -> tuple[Path, Path, SimpleNamespace]
 
     synthetic_path = tmp_path / "synthetic.csv"
     source.iloc[train_ids[:8]].to_csv(synthetic_path, index=False)
+    prepared_path = tmp_path / "prepared.csv"
+    source.iloc[train_ids].to_csv(prepared_path, index=False)
+    tabdiff_input_path = tmp_path / "tabdiff_input.csv"
+    source.iloc[train_ids].to_csv(tabdiff_input_path, index=False)
+    raw_path = tmp_path / "raw_samples.csv"
+    source.iloc[train_ids[:8]].to_csv(raw_path, index=False)
+    metadata_path = tmp_path / "prepared_metadata.json"
+    metadata_path.write_text('{"prepared": true}\n', encoding="utf-8")
     checkpoint_path = tmp_path / "best_ema_model_current.pt"
     checkpoint_path.write_bytes(b"checkpoint")
     config_snapshot = generation_config_snapshot()
@@ -93,8 +107,16 @@ def _write_valid_artifacts(tmp_path: Path) -> tuple[Path, Path, SimpleNamespace]
             "deterministic": True,
             "config": config_snapshot,
             "config_sha256": canonical_sha256(config_snapshot),
-            "prepared_csv_sha256": file_sha256(source_path),
-            "raw_samples_sha256": file_sha256(synthetic_path),
+            "scientific_code_sha256": "d" * 64,
+            "protocol_sha256": "e" * 64,
+            "metadata_path": str(metadata_path),
+            "metadata_sha256": file_sha256(metadata_path),
+            "prepared_csv_path": str(prepared_path),
+            "prepared_csv_sha256": file_sha256(prepared_path),
+            "tabdiff_input_csv_path": str(tabdiff_input_path),
+            "tabdiff_input_csv_sha256": file_sha256(tabdiff_input_path),
+            "raw_samples_path": str(raw_path),
+            "raw_samples_sha256": file_sha256(raw_path),
             "checkpoint_path": str(checkpoint_path),
             "checkpoint_sha256": file_sha256(checkpoint_path),
         },
@@ -110,6 +132,7 @@ def _write_valid_artifacts(tmp_path: Path) -> tuple[Path, Path, SimpleNamespace]
         encoding="utf-8",
     )
     bundle = SimpleNamespace(
+        data_path=str(source_path),
         source_sha256=file_sha256(source_path),
         schema_hash=schema_sha256([*PAPER_FEATURE_KEYS, "YS"]),
         split_seed=42,
@@ -148,9 +171,63 @@ def test_runner_validator_accepts_matching_source_split_and_generation_seed(tmp_
         split_seed=42,
         split_method="stratified_random",
         generation_seed=0,
+        expected_scientific_code_sha256="d" * 64,
+        expected_generation_protocol_sha256="e" * 64,
     )
 
     assert result["synthetic_sha256"] == file_sha256(synthetic_path)
+    assert result["provenance_sha256"] == file_sha256(synthetic_provenance_path(synthetic_path))
+
+
+@pytest.mark.parametrize(
+    ("section", "path_field", "message"),
+    [
+        ("source", "path", "source data was not found"),
+        ("generation", "metadata_path", "prepared metadata was not found"),
+        ("generation", "prepared_csv_path", "prepared training CSV was not found"),
+        ("generation", "tabdiff_input_csv_path", "TabDiff input CSV was not found"),
+        ("generation", "raw_samples_path", "raw TabDiff samples was not found"),
+        ("generation", "checkpoint_path", "TabDiff checkpoint was not found"),
+    ],
+)
+def test_validator_requires_every_bound_local_dependency(
+    tmp_path: Path,
+    section: str,
+    path_field: str,
+    message: str,
+) -> None:
+    _, synthetic_path, bundle = _write_valid_artifacts(tmp_path)
+    sidecar_path = synthetic_provenance_path(synthetic_path)
+    provenance = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    Path(provenance[section][path_field]).unlink()
+
+    with pytest.raises(SyntheticProvenanceError, match=message):
+        validate_synthetic_provenance_for_data_bundle(synthetic_path, bundle, generation_seed=0)
+
+
+@pytest.mark.parametrize(
+    ("expected_code", "expected_protocol", "message"),
+    [
+        ("0" * 64, "e" * 64, "scientific_code_sha256"),
+        ("d" * 64, "0" * 64, "protocol_sha256"),
+    ],
+)
+def test_validator_binds_generation_code_and_protocol(
+    tmp_path: Path,
+    expected_code: str,
+    expected_protocol: str,
+    message: str,
+) -> None:
+    _, synthetic_path, bundle = _write_valid_artifacts(tmp_path)
+
+    with pytest.raises(SyntheticProvenanceError, match=message):
+        validate_synthetic_provenance_for_data_bundle(
+            synthetic_path,
+            bundle,
+            generation_seed=0,
+            expected_scientific_code_sha256=expected_code,
+            expected_generation_protocol_sha256=expected_protocol,
+        )
 
 
 @pytest.mark.parametrize(
@@ -378,3 +455,228 @@ def test_create_dataloaders_preserves_allow_synthetic_positional_slot() -> None:
     parameters = list(inspect.signature(create_dataloaders).parameters)
 
     assert parameters.index("allow_synthetic") < parameters.index("split_seed")
+
+
+def _write_validation_metric_artifacts(
+    tmp_path: Path,
+) -> tuple[list[Path], np.ndarray]:
+    paths: list[Path] = []
+    rows: list[list[float]] = []
+    for run_index in range(10):
+        metrics = [
+            10.0 + run_index,
+            4.0 + 0.5 * run_index,
+            2.0 + 0.1 * run_index,
+            0.25 + 0.01 * run_index,
+            8.0 + 0.75 * run_index,
+        ]
+        artifact = {
+            "partition": "validation",
+            "source_data_sha256": "a" * 64,
+            "combined_split_sha256": "b" * 64,
+            "config_sha256": "c" * 64,
+            "effective_protocol_sha256": "d" * 64,
+            "validation_metrics": metrics,
+        }
+        path = tmp_path / f"validation_metrics_run_{run_index + 1}.json"
+        path.write_text(json.dumps(artifact), encoding="utf-8")
+        paths.append(path)
+        rows.append(metrics)
+    return paths, np.asarray(rows, dtype=np.float64)
+
+
+def _write_cross_run_statistics(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    paths, _ = _write_validation_metric_artifacts(tmp_path)
+    path = tmp_path / "cbtg_cross_run_validation_std.json"
+    result = produce_cbtg_cross_run_validation_std(
+        paths,
+        path,
+        source_data_sha256="a" * 64,
+        combined_split_sha256="b" * 64,
+        config_sha256="c" * 64,
+        producer_protocol_sha256="d" * 64,
+    )
+    return path, result["payload"]
+
+
+def test_cross_run_producer_binds_each_run_and_recomputes_sample_std(tmp_path: Path) -> None:
+    paths, matrix = _write_validation_metric_artifacts(tmp_path)
+    path = tmp_path / "cbtg_cross_run_validation_std.json"
+
+    result = produce_cbtg_cross_run_validation_std(
+        list(reversed(paths)),
+        path,
+        source_data_sha256="a" * 64,
+        combined_split_sha256="b" * 64,
+        config_sha256="c" * 64,
+        producer_protocol_sha256="d" * 64,
+    )
+    payload = result["payload"]
+
+    assert result["sha256"] == file_sha256(path)
+    assert payload["format"] == CBTG_CROSS_RUN_FORMAT
+    assert payload["ddof"] == CBTG_CROSS_RUN_DDOF
+    assert "seeds" not in payload
+    assert all("seed" not in run for run in payload["runs"])
+    assert [run["metrics_artifact_sha256"] for run in payload["runs"]] == [
+        file_sha256(path) for path in reversed(paths)
+    ]
+    np.testing.assert_allclose(
+        payload["validation_metric_std"],
+        np.std(matrix, axis=0, ddof=1),
+    )
+
+
+def test_cross_run_statistics_bind_source_split_config_and_protocol(tmp_path: Path) -> None:
+    path, payload = _write_cross_run_statistics(tmp_path)
+
+    result = validate_cbtg_cross_run_validation_std(
+        path,
+        expected_split_sha256="b" * 64,
+        expected_source_data_sha256="a" * 64,
+        expected_config_sha256="c" * 64,
+        expected_producer_protocol_sha256="d" * 64,
+    )
+
+    assert result["sha256"] == file_sha256(path)
+    assert result["payload"] == payload
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("format", "legacy", "format"),
+        ("source", "epoch_history", "independent validation runs"),
+        ("partition", "test", "partition"),
+        ("ddof", 0, "ddof"),
+        ("metric_names", ["RMSE"], "metric order"),
+        ("validation_metric_std", [1.0, 0.8, float("nan"), 0.02, 1.2], "finite"),
+        ("num_runs", 9, "ten independent"),
+        ("combined_split_sha256", "bad", "combined_split_sha256"),
+        ("source_data_sha256", "bad", "source_data_sha256"),
+        ("config_sha256", "bad", "config_sha256"),
+        ("producer_protocol_sha256", "bad", "producer_protocol_sha256"),
+    ],
+)
+def test_cross_run_statistics_fail_closed(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    path, payload = _write_cross_run_statistics(tmp_path)
+    payload[field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ProtocolIntegrityError, match=message):
+        validate_cbtg_cross_run_validation_std(path)
+
+
+def test_cross_run_statistics_reject_active_split_mismatch(tmp_path: Path) -> None:
+    path, _ = _write_cross_run_statistics(tmp_path)
+
+    with pytest.raises(ProtocolIntegrityError, match="active split"):
+        validate_cbtg_cross_run_validation_std(path, expected_split_sha256="e" * 64)
+
+
+def test_cross_run_statistics_do_not_trust_stored_aggregate(tmp_path: Path) -> None:
+    path, payload = _write_cross_run_statistics(tmp_path)
+    payload["validation_metric_std"] = [0.0] * len(CBTG_CROSS_RUN_METRICS)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ProtocolIntegrityError, match="aggregate does not match"):
+        validate_cbtg_cross_run_validation_std(path)
+
+
+def test_cross_run_statistics_allow_run_reordering_and_reject_bad_artifact_hash(
+    tmp_path: Path,
+) -> None:
+    path, payload = _write_cross_run_statistics(tmp_path)
+    payload["runs"][0], payload["runs"][1] = payload["runs"][1], payload["runs"][0]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    validate_cbtg_cross_run_validation_std(path)
+
+    path, payload = _write_cross_run_statistics(tmp_path)
+    payload["runs"][1]["metrics_artifact_sha256"] = payload["runs"][0][
+        "metrics_artifact_sha256"
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ProtocolIntegrityError, match="must be unique"):
+        validate_cbtg_cross_run_validation_std(path)
+
+    path, payload = _write_cross_run_statistics(tmp_path)
+    payload["runs"][0]["metrics_artifact_sha256"] = "bad"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ProtocolIntegrityError, match="metrics_artifact_sha256"):
+        validate_cbtg_cross_run_validation_std(path)
+
+
+def test_cross_run_statistics_reject_duplicate_result_files(tmp_path: Path) -> None:
+    paths, _ = _write_validation_metric_artifacts(tmp_path)
+    duplicate_path_list = [paths[0], paths[0], *paths[2:]]
+
+    with pytest.raises(ProtocolIntegrityError, match="unique files"):
+        produce_cbtg_cross_run_validation_std(
+            duplicate_path_list,
+            tmp_path / "duplicate_path_stats.json",
+            source_data_sha256="a" * 64,
+            combined_split_sha256="b" * 64,
+            config_sha256="c" * 64,
+            producer_protocol_sha256="d" * 64,
+        )
+
+    paths, _ = _write_validation_metric_artifacts(tmp_path)
+    paths[1].write_bytes(paths[0].read_bytes())
+    with pytest.raises(ProtocolIntegrityError, match="unique files"):
+        produce_cbtg_cross_run_validation_std(
+            paths,
+            tmp_path / "duplicate_hash_stats.json",
+            source_data_sha256="a" * 64,
+            combined_split_sha256="b" * 64,
+            config_sha256="c" * 64,
+            producer_protocol_sha256="d" * 64,
+        )
+
+
+def test_cross_run_producer_rejects_nonvalidation_or_mismatched_provenance(tmp_path: Path) -> None:
+    paths, _ = _write_validation_metric_artifacts(tmp_path)
+    artifact = json.loads(paths[0].read_text(encoding="utf-8"))
+    artifact["partition"] = "test"
+    paths[0].write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(ProtocolIntegrityError, match="partition must be validation"):
+        produce_cbtg_cross_run_validation_std(
+            paths,
+            tmp_path / "stats.json",
+            source_data_sha256="a" * 64,
+            combined_split_sha256="b" * 64,
+            config_sha256="c" * 64,
+            producer_protocol_sha256="d" * 64,
+        )
+
+    paths, _ = _write_validation_metric_artifacts(tmp_path)
+    artifact = json.loads(paths[0].read_text(encoding="utf-8"))
+    artifact["config_sha256"] = "e" * 64
+    paths[0].write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(ProtocolIntegrityError, match="does not match config_sha256"):
+        produce_cbtg_cross_run_validation_std(
+            paths,
+            tmp_path / "stats.json",
+            source_data_sha256="a" * 64,
+            combined_split_sha256="b" * 64,
+            config_sha256="c" * 64,
+            producer_protocol_sha256="d" * 64,
+        )
+
+
+def test_cross_run_validator_normalizes_legacy_split_field(tmp_path: Path) -> None:
+    path, payload = _write_cross_run_statistics(tmp_path)
+    payload["split_sha256"] = payload.pop("combined_split_sha256")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = validate_cbtg_cross_run_validation_std(
+        path,
+        expected_combined_split_sha256="b" * 64,
+    )
+
+    assert result["payload"]["combined_split_sha256"] == "b" * 64
+    assert "split_sha256" not in result["payload"]

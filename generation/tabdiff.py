@@ -69,6 +69,10 @@ def exp_name() -> str:
     return str(getattr(config, "TABDIFF_EXP_NAME", "capl_tabdiff"))
 
 
+def base_exp_name() -> str:
+    return f"{exp_name()}_base"
+
+
 def generation_seed() -> int:
     """Return the seed implemented by official TabDiff deterministic mode."""
     seed = int(getattr(config, "TABDIFF_GENERATION_SEED", TABDIFF_DETERMINISTIC_SEED))
@@ -87,7 +91,14 @@ def process_command(repo: Path, name: str | None = None) -> TabDiffCommand:
     )
 
 
-def train_command(repo: Path, name: str | None = None) -> TabDiffCommand:
+def _training_command(
+    repo: Path,
+    name: str | None,
+    *,
+    experiment: str,
+    checkpoint_path: str | Path | None,
+    mechanism_finetune: bool,
+) -> TabDiffCommand:
     generation_seed()
     cmd = [
         sys.executable,
@@ -98,16 +109,41 @@ def train_command(repo: Path, name: str | None = None) -> TabDiffCommand:
         "train",
         "--no_wandb",
         "--exp_name",
-        exp_name(),
+        experiment,
         "--gpu",
         str(getattr(config, "TABDIFF_GPU", -1)),
         "--deterministic",
     ]
-    ckpt_path = str(getattr(config, "TABDIFF_CKPT_PATH", "") or "")
-    if ckpt_path:
-        cmd.extend(["--ckpt_path", str(project_path(ckpt_path))])
-    _append_mechanism_args(cmd, for_sampling=False)
+    if checkpoint_path:
+        cmd.extend(["--ckpt_path", str(project_path(checkpoint_path))])
+    if mechanism_finetune:
+        _append_mechanism_args(cmd, for_sampling=False)
     return TabDiffCommand(command=cmd, cwd=repo)
+
+
+def base_train_command(repo: Path, name: str | None = None) -> TabDiffCommand:
+    return _training_command(
+        repo,
+        name,
+        experiment=base_exp_name(),
+        checkpoint_path=None,
+        mechanism_finetune=False,
+    )
+
+
+def train_command(
+    repo: Path,
+    name: str | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> TabDiffCommand:
+    effective_checkpoint = checkpoint_path or getattr(config, "TABDIFF_CKPT_PATH", "") or None
+    return _training_command(
+        repo,
+        name,
+        experiment=exp_name(),
+        checkpoint_path=effective_checkpoint,
+        mechanism_finetune=True,
+    )
 
 
 def sample_command(
@@ -222,9 +258,13 @@ def expected_sample_patterns(repo: Path, name: str | None = None) -> list[Path]:
     ]
 
 
-def checkpoint_output_snapshot(repo: Path, name: str | None = None) -> dict[str, tuple[int, int, str]]:
+def checkpoint_output_snapshot(
+    repo: Path,
+    name: str | None = None,
+    experiment: str | None = None,
+) -> dict[str, tuple[int, int, str]]:
     """Capture existing official TabDiff checkpoint outputs."""
-    checkpoint_dir = repo / "tabdiff" / "ckpt" / (name or dataname()) / exp_name()
+    checkpoint_dir = repo / "tabdiff" / "ckpt" / (name or dataname()) / (experiment or exp_name())
     snapshot: dict[str, tuple[int, int, str]] = {}
     if not checkpoint_dir.exists():
         return snapshot
@@ -241,9 +281,10 @@ def find_fresh_checkpoint(
     repo: Path,
     name: str | None,
     previous_snapshot: dict[str, tuple[int, int, str]],
+    experiment: str | None = None,
 ) -> Path:
     """Return a checkpoint created or updated by the current train command."""
-    current = checkpoint_output_snapshot(repo, name)
+    current = checkpoint_output_snapshot(repo, name, experiment)
     changed = [Path(path) for path, signature in current.items() if previous_snapshot.get(path) != signature]
     if len(changed) != 1:
         raise RuntimeError(

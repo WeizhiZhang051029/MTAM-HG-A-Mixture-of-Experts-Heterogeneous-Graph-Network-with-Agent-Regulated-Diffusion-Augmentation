@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -22,7 +24,6 @@ from metrics import compute_metrics
 from models.mtam_hg import MECHANISM_EXPERT_NODE_GROUPS
 from train import (
     build_experiment_model,
-    build_finetune_optimizer,
     checkpoint_payload,
     count_total_parameters,
     count_trainable_parameters,
@@ -53,6 +54,7 @@ class SyntheticBundle:
     nearest_train_index: np.ndarray
     nearest_train_y_raw: np.ndarray
     synthetic_sha256: str = ""
+    provenance_sha256: str = ""
 
 
 @dataclass
@@ -79,7 +81,17 @@ class DynamicSyntheticState:
     refresh_count: int = 0
     cluster_ids: np.ndarray | None = None
     previous_cluster_rmse: np.ndarray | None = None
-    validation_metric_history: list[np.ndarray] = field(default_factory=list)
+    cross_run_validation_std: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class CrossRunValidationStats:
+    metric_std: np.ndarray
+    num_runs: int
+    split_sha256: str
+    source: str
+    path: Path
+    sha256: str
 
 
 PAPER_CBTG_METRIC_NAMES = ("RMSE", "MAE", "MAPE", "ONE_MINUS_R2", "TAIL_MAE")
@@ -104,6 +116,57 @@ AGENT_FEEDBACK_FEATURE_NAMES = tuple(
     for metric in PAPER_CBTG_METRIC_NAMES
     for component in PAPER_CBTG_STATE_COMPONENTS
 )
+
+
+def _validated_cross_run_std(values: np.ndarray | list[float]) -> np.ndarray:
+    std = np.asarray(values, dtype=np.float64).reshape(-1)
+    expected = (len(PAPER_CBTG_METRIC_NAMES),)
+    if std.shape != expected or not np.isfinite(std).all() or np.any(std < 0.0):
+        raise ValueError(f"validation_metric_std must contain {expected[0]} finite non-negative values.")
+    return std
+
+
+def load_cross_run_validation_stats(
+    data_bundle: DataBundle,
+    path: str | Path | None = None,
+) -> CrossRunValidationStats:
+    raw_path = path or getattr(config, "CBTG_CROSS_RUN_VALIDATION_STD_PATH", "")
+    if not raw_path:
+        raise RuntimeError("CBTG cross-run validation statistics are required.")
+    stats_path = Path(raw_path)
+    if not stats_path.is_absolute():
+        stats_path = Path(config.PROJECT_ROOT) / stats_path
+    from protocol_integrity import validate_cbtg_cross_run_validation_std
+
+    config_sha256 = str(getattr(config, "CONFIG_SHA256", "") or "")
+    result = validate_cbtg_cross_run_validation_std(
+        stats_path,
+        expected_split_sha256=str(data_bundle.combined_split_hash),
+        expected_source_data_sha256=str(data_bundle.source_sha256),
+        expected_config_sha256=config_sha256 or None,
+    )
+    payload = result["payload"]
+    num_runs = int(payload["num_runs"])
+    if num_runs != 10:
+        raise ValueError("CBTG statistics require ten independent validation runs.")
+    split_sha256 = str(payload["combined_split_sha256"])
+    return CrossRunValidationStats(
+        metric_std=_validated_cross_run_std(payload["validation_metric_std"]),
+        num_runs=num_runs,
+        split_sha256=split_sha256,
+        source="independent_validation_runs",
+        path=Path(result["path"]),
+        sha256=str(result["sha256"]),
+    )
+
+
+def assert_cross_run_validation_stats_current(
+    stats: CrossRunValidationStats,
+    data_bundle: DataBundle,
+) -> None:
+    current = load_cross_run_validation_stats(data_bundle, stats.path)
+    if current.sha256 != stats.sha256:
+        raise RuntimeError("CBTG cross-run validation statistics changed during training.")
 
 
 class SyntheticQualityAgent(nn.Module):
@@ -588,8 +651,15 @@ def _load_synthetic_bundle(data_bundle: DataBundle, synthetic_path: str | Path |
         data_bundle,
         int(getattr(config, "TABDIFF_GENERATION_SEED", 0)),
         synthetic_snapshot=table_snapshot,
+        expected_scientific_code_sha256=(
+            str(getattr(config, "EXPECTED_SCIENTIFIC_CODE_SHA256", "") or "") or None
+        ),
+        expected_generation_protocol_sha256=(
+            str(getattr(config, "EXPECTED_GENERATION_PROTOCOL_SHA256", "") or "") or None
+        ),
     )
     synthetic_sha256 = str(provenance["synthetic_sha256"])
+    provenance_sha256 = str(provenance["provenance_sha256"])
 
     df = table_snapshot.frame.copy()
     df.columns = [str(col) for col in df.columns]
@@ -658,6 +728,7 @@ def _load_synthetic_bundle(data_bundle: DataBundle, synthetic_path: str | Path |
         nearest_train_index=scores["nearest_train_index"],
         nearest_train_y_raw=scores["nearest_train_y_raw"],
         synthetic_sha256=synthetic_sha256,
+        provenance_sha256=provenance_sha256,
     )
     assert_file_snapshot_current(table_snapshot.file, "synthetic data")
     return bundle
@@ -785,12 +856,12 @@ def build_paper_cbtg_feedback(
 ) -> dict[str, np.ndarray]:
     """Build CBTG states and clipped rewards."""
     overall = np.asarray(overall_metrics, dtype=np.float64).reshape(-1)
-    std = np.asarray(run_std, dtype=np.float64).reshape(-1)
+    std = _validated_cross_run_std(run_std)
     clusters = np.asarray(per_cluster_metrics, dtype=np.float64)
     ids = np.asarray(sample_cluster_ids, dtype=np.int64).reshape(-1)
     metric_count = len(PAPER_CBTG_METRIC_NAMES)
-    if overall.shape != (metric_count,) or std.shape != (metric_count,):
-        raise ValueError(f"overall_metrics and run_std must each have shape ({metric_count},).")
+    if overall.shape != (metric_count,):
+        raise ValueError(f"overall_metrics must have shape ({metric_count},).")
     if clusters.ndim != 2 or clusters.shape[1] != metric_count or clusters.shape[0] < 1:
         raise ValueError(f"per_cluster_metrics must have shape (G, {metric_count}) with G >= 1.")
 
@@ -846,8 +917,8 @@ def build_paper_cbtg_feedback(
 def evaluate_validation_pretrain_feedback(
     model: torch.nn.Module,
     data_bundle: DataBundle,
-    dynamic_state: DynamicSyntheticState,
     device: torch.device,
+    cross_run_validation_std: np.ndarray,
     cluster_model: WorkingConditionCluster | None = None,
 ) -> dict[str, np.ndarray | float]:
     """Compute paper CBTG feedback exclusively from real validation rows."""
@@ -875,9 +946,7 @@ def evaluate_validation_pretrain_feedback(
         y_pred = pred_scaled.reshape(-1)
 
     overall = _paper_oriented_metrics(y_true, y_pred, data_bundle.tail_thresholds)
-    dynamic_state.validation_metric_history.append(overall.copy())
-    history = np.stack(dynamic_state.validation_metric_history, axis=0)
-    run_std = np.std(history, axis=0, ddof=0)
+    run_std = _validated_cross_run_std(cross_run_validation_std)
 
     if cluster_model is not None and cluster_model.is_fitted:
         validation_cluster_ids = cluster_model.predict(x_val)
@@ -900,6 +969,7 @@ def evaluate_validation_pretrain_feedback(
     return {
         "overall_metrics": overall.astype(np.float64),
         "run_std": run_std.astype(np.float64),
+        "cross_run_validation_std": run_std.astype(np.float64),
         "per_cluster_metrics": per_cluster.astype(np.float64),
         "validation_cluster_ids": validation_cluster_ids.astype(np.int64),
         "validation_rmse": float(overall[0]),
@@ -932,6 +1002,7 @@ def agent_policy_quota_multiplier(
 def build_dynamic_synthetic_state(
     synthetic_bundle: SyntheticBundle,
     data_bundle: DataBundle,
+    cross_run_validation_std: np.ndarray,
     cluster_model: WorkingConditionCluster | None = None,
 ) -> DynamicSyntheticState:
     n = len(synthetic_bundle.frame)
@@ -976,6 +1047,7 @@ def build_dynamic_synthetic_state(
         feedback_features=zero_agent_feedback_features(n),
         feedback_target=np.zeros(n, dtype=np.float64),
         cluster_ids=cluster_ids,
+        cross_run_validation_std=_validated_cross_run_std(cross_run_validation_std),
     )
 
 
@@ -1102,6 +1174,7 @@ def refresh_dynamic_synthetic_weights(
     dynamic_state: DynamicSyntheticState,
     device: torch.device,
     epoch: int,
+    cross_run_validation_std: np.ndarray,
     cluster_model: WorkingConditionCluster | None = None,
     optimizer: AdamW | None = None,
 ) -> dict[str, float]:
@@ -1141,11 +1214,17 @@ def refresh_dynamic_synthetic_weights(
             synthetic_mse[sample_ids_np] = synthetic_batch_mse.detach().cpu().numpy().reshape(-1)
             train_region_mse[sample_ids_np] = mse_real.detach().cpu().numpy().reshape(-1)
 
+    run_std = _validated_cross_run_std(cross_run_validation_std)
+    if dynamic_state.cross_run_validation_std is None or not np.array_equal(
+        run_std,
+        dynamic_state.cross_run_validation_std,
+    ):
+        raise RuntimeError("CBTG cross-run validation statistics changed during training.")
     validation_feedback = evaluate_validation_pretrain_feedback(
         model,
         data_bundle,
-        dynamic_state,
         device,
+        run_std,
         cluster_model=cluster_model,
     )
     sample_cluster_ids = (
@@ -1355,6 +1434,7 @@ def _synthetic_step(
     train_tensors: TrainTensorBundle,
     device: torch.device,
     dynamic_state: DynamicSyntheticState | None = None,
+    update_quality_agent: bool = True,
 ) -> dict[str, float]:
     x, y, sample_ids = batch
     x = x.to(device)
@@ -1377,7 +1457,11 @@ def _synthetic_step(
             dtype=y.dtype,
             device=device,
         ).reshape(-1)
-    quality_score = quality_agent(x, y, feedback_batch).reshape(-1).clamp(1.0e-6, 1.0 - 1.0e-6)
+    if update_quality_agent:
+        quality_score = quality_agent(x, y, feedback_batch).reshape(-1).clamp(1.0e-6, 1.0 - 1.0e-6)
+    else:
+        with torch.no_grad():
+            quality_score = quality_agent(x, y, feedback_batch).reshape(-1).clamp(1.0e-6, 1.0 - 1.0e-6)
     mse_real, _, _, _ = _real_mse_reward_for_indices(
         model,
         train_tensors,
@@ -1430,7 +1514,7 @@ def _synthetic_step(
 
     agent_loss = torch.tensor(0.0, device=device)
     agent_logs: dict[str, float] = {}
-    if bool(getattr(config, "SYNTHETIC_USE_REWARD_LOSS", True)):
+    if update_quality_agent and bool(getattr(config, "SYNTHETIC_USE_REWARD_LOSS", True)):
         agent_loss, agent_components = paper_cbtg_agent_loss(quality_score, reward)
         agent_logs = {
             "agent_reward_loss": float(agent_components["expected_reward_loss"].detach().cpu()),
@@ -1453,7 +1537,8 @@ def _synthetic_step(
     optimizer.zero_grad()
     total.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_NORM)
-    torch.nn.utils.clip_grad_norm_(quality_agent.parameters(), config.GRAD_CLIP_NORM)
+    if update_quality_agent:
+        torch.nn.utils.clip_grad_norm_(quality_agent.parameters(), config.GRAD_CLIP_NORM)
     optimizer.step()
 
     gate_probs = outputs.get("gate_probs")
@@ -1504,6 +1589,7 @@ def _synthetic_step(
         "dynamic_synthetic_weight_std": float(dynamic_batch_weight.detach().std(unbiased=False).cpu()) if dynamic_batch_weight is not None else float("nan"),
         "synthetic_expert_uncertainty_mean": float(expert_uncertainty.detach().mean().cpu()) if expert_uncertainty is not None else float("nan"),
         "synthetic_gate_entropy": float(entropy.detach().cpu()),
+        "synthetic_agent_update_active": float(update_quality_agent),
     }
 
 
@@ -1518,6 +1604,130 @@ def _average_logs(rows: list[dict[str, float]]) -> dict[str, float]:
     return out
 
 
+def calibrate_quality_agent_on_real(
+    model: torch.nn.Module,
+    quality_agent: torch.nn.Module,
+    data_bundle: DataBundle,
+    device: torch.device,
+    epoch: int,
+    *,
+    optimizer: AdamW,
+    cross_run_validation_std: np.ndarray,
+    cluster_model: WorkingConditionCluster,
+) -> tuple[
+    dict[str, float],
+    Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+]:
+    validation_feedback = evaluate_validation_pretrain_feedback(
+        model,
+        data_bundle,
+        device,
+        cross_run_validation_std,
+        cluster_model=cluster_model,
+    )
+    quality_agent.train()
+    losses: list[float] = []
+    reward_losses: list[float] = []
+    mean_regularizers: list[float] = []
+    entropies: list[float] = []
+    for batch in data_bundle.train_loader:
+        x, y = batch[0].to(device), batch[1].to(device)
+        cluster_ids = cluster_model.predict_tensor(x).numpy()
+        feedback = build_paper_cbtg_feedback(
+            np.asarray(validation_feedback["overall_metrics"], dtype=np.float64),
+            np.asarray(validation_feedback["cross_run_validation_std"], dtype=np.float64),
+            np.asarray(validation_feedback["per_cluster_metrics"], dtype=np.float64),
+            cluster_ids,
+        )
+        features = torch.tensor(feedback["features"], dtype=x.dtype, device=device)
+        reward = torch.tensor(feedback["target"], dtype=y.dtype, device=device)
+        confidence = quality_agent(x, y, features).reshape(-1)
+        loss, parts = paper_cbtg_agent_loss(confidence, reward)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(quality_agent.parameters(), config.GRAD_CLIP_NORM)
+        optimizer.step()
+        losses.append(float(loss.detach().cpu()))
+        reward_losses.append(float(parts["expected_reward_loss"].detach().cpu()))
+        mean_regularizers.append(float(parts["mean_regularizer"].detach().cpu()))
+        entropies.append(float(parts["confidence_entropy"].detach().cpu()))
+    if not losses:
+        raise ValueError("CBTG-Agent requires a non-empty real training loader.")
+    quality_agent.eval()
+
+    def real_batch_weights(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        cluster_ids = cluster_model.predict_tensor(x).numpy()
+        feedback = build_paper_cbtg_feedback(
+            np.asarray(validation_feedback["overall_metrics"], dtype=np.float64),
+            np.asarray(validation_feedback["cross_run_validation_std"], dtype=np.float64),
+            np.asarray(validation_feedback["per_cluster_metrics"], dtype=np.float64),
+            cluster_ids,
+        )
+        features = torch.tensor(feedback["features"], dtype=x.dtype, device=x.device)
+        with torch.no_grad():
+            return quality_agent(x, y, features).reshape(-1, 1).detach()
+
+    logs = {
+        "real_cbtg_agent_epoch": float(epoch),
+        "real_cbtg_agent_loss": float(np.mean(losses)),
+        "real_cbtg_expected_reward_loss": float(np.mean(reward_losses)),
+        "real_cbtg_mean_regularizer": float(np.mean(mean_regularizers)),
+        "real_cbtg_confidence_entropy": float(np.mean(entropies)),
+        "real_cbtg_validation_rmse": float(validation_feedback["validation_rmse"]),
+        "real_cbtg_validation_mae": float(validation_feedback["validation_mae"]),
+        "real_cbtg_validation_mape": float(validation_feedback["validation_mape"]),
+        "real_cbtg_validation_one_minus_r2": float(validation_feedback["validation_one_minus_r2"]),
+        "real_cbtg_validation_tail_mae": float(validation_feedback["validation_tail_mae"]),
+    }
+    return logs, real_batch_weights
+
+
+def build_synthetic_pretrain_optimizer(
+    model: torch.nn.Module,
+    quality_agent: torch.nn.Module,
+) -> AdamW:
+    pretrain_lr = float(config.LR)
+    agent_lr = float(getattr(config, "SYNTHETIC_AGENT_LR", pretrain_lr))
+    if not np.isclose(agent_lr, pretrain_lr, rtol=0.0, atol=1.0e-12):
+        raise ValueError("Synthetic model and CBTG-Agent must use the same pretraining learning rate.")
+    return AdamW(
+        [
+            {"params": model.parameters(), "name": "synthetic_model"},
+            {"params": quality_agent.parameters(), "name": "synthetic_quality_agent"},
+        ],
+        lr=pretrain_lr,
+        weight_decay=config.WEIGHT_DECAY,
+    )
+
+
+def quality_agent_updates_enabled(epoch: int) -> bool:
+    agent_epochs = int(getattr(config, "SYNTHETIC_AGENT_EPOCHS", 0))
+    if agent_epochs < 1:
+        raise ValueError("SYNTHETIC_AGENT_EPOCHS must be positive.")
+    return int(epoch) <= agent_epochs
+
+
+def dynamic_synthetic_refresh_due(
+    epoch: int,
+    refresh_epochs: int | None = None,
+    warmup_epochs: int | None = None,
+) -> bool:
+    refresh = int(
+        getattr(config, "DYNAMIC_SYNTHETIC_REFRESH_EPOCHS", 5)
+        if refresh_epochs is None
+        else refresh_epochs
+    )
+    warmup = int(
+        getattr(config, "DYNAMIC_SYNTHETIC_WARMUP_EPOCHS", 0)
+        if warmup_epochs is None
+        else warmup_epochs
+    )
+    if refresh < 1 or warmup < 0:
+        raise ValueError("Dynamic refresh must be positive and warmup must be non-negative.")
+    current = int(epoch)
+    return current > warmup and (current - warmup - 1) % refresh == 0
+
+
 def pretrain_with_cbtg(
     model: torch.nn.Module,
     quality_agent: SyntheticQualityAgent,
@@ -1525,27 +1735,20 @@ def pretrain_with_cbtg(
     data_bundle: DataBundle,
     train_tensors: TrainTensorBundle,
     device: torch.device,
+    cross_run_validation_std: np.ndarray,
     epochs: int | None = None,
     cluster_model: WorkingConditionCluster | None = None,
 ) -> Path:
     epochs = int(epochs or getattr(config, "SYNTHETIC_PRETRAIN_EPOCHS", 20))
-    if bool(getattr(config, "USE_LAYERWISE_FINETUNE_LR", False)):
-        optimizer = build_finetune_optimizer(model)
-        optimizer.add_param_group(
-            {
-                "params": list(quality_agent.parameters()),
-                "lr": float(getattr(config, "FINETUNE_QUALITY_AGENT_LR", getattr(config, "SYNTHETIC_AGENT_LR", config.LR))),
-                "name": "synthetic_quality_agent",
-            }
-        )
-    else:
-        optimizer = AdamW(
-            [
-                {"params": model.parameters(), "lr": config.LR},
-                {"params": quality_agent.parameters(), "lr": float(getattr(config, "SYNTHETIC_AGENT_LR", config.LR))},
-            ],
-            weight_decay=config.WEIGHT_DECAY,
-        )
+    run_std = _validated_cross_run_std(cross_run_validation_std)
+    pretrain_lr = float(config.LR)
+    agent_epochs = int(getattr(config, "SYNTHETIC_AGENT_EPOCHS", epochs))
+    if agent_epochs < 1:
+        raise ValueError("SYNTHETIC_AGENT_EPOCHS must be positive.")
+    optimizer = build_synthetic_pretrain_optimizer(model, quality_agent)
+    refresh_epochs = int(getattr(config, "DYNAMIC_SYNTHETIC_REFRESH_EPOCHS", 5))
+    warmup_epochs = int(getattr(config, "DYNAMIC_SYNTHETIC_WARMUP_EPOCHS", 0))
+    dynamic_synthetic_refresh_due(1, refresh_epochs, warmup_epochs)
     log_path = config.LOG_DIR / "cbtg_pretrain_log.csv"
     if log_path.exists():
         log_path.unlink()
@@ -1553,7 +1756,12 @@ def pretrain_with_cbtg(
     if dynamic_log_path.exists():
         dynamic_log_path.unlink()
     dynamic_state = (
-        build_dynamic_synthetic_state(synthetic_bundle, data_bundle, cluster_model=cluster_model)
+        build_dynamic_synthetic_state(
+            synthetic_bundle,
+            data_bundle,
+            run_std,
+            cluster_model=cluster_model,
+        )
         if bool(getattr(config, "USE_DYNAMIC_SYNTHETIC_AGENT", False))
         else None
     )
@@ -1564,10 +1772,12 @@ def pretrain_with_cbtg(
     start = time.perf_counter()
     progress = tqdm(range(1, epochs + 1), desc="Synthetic pretrain", unit="epoch")
     for epoch in progress:
+        update_quality_agent = quality_agent_updates_enabled(epoch)
+        quality_agent.requires_grad_(update_quality_agent)
+        quality_agent.train(update_quality_agent)
         refresh_logs: dict[str, float | str] = {}
         if dynamic_state is not None:
-            refresh_epochs = 5
-            should_refresh = epoch % refresh_epochs == 0
+            should_refresh = dynamic_synthetic_refresh_due(epoch, refresh_epochs, warmup_epochs)
             if should_refresh:
                 refresh_logs = refresh_dynamic_synthetic_weights(
                     model,
@@ -1578,8 +1788,9 @@ def pretrain_with_cbtg(
                     dynamic_state,
                     device,
                     epoch,
+                    run_std,
                     cluster_model=cluster_model,
-                    optimizer=optimizer,
+                    optimizer=optimizer if update_quality_agent else None,
                 )
                 rebuild_synthetic_loader(synthetic_bundle, dynamic_state)
                 append_csv(dynamic_log_path, refresh_logs)
@@ -1597,6 +1808,7 @@ def pretrain_with_cbtg(
                     train_tensors,
                     device,
                     dynamic_state=dynamic_state,
+                    update_quality_agent=update_quality_agent,
                 )
             )
         avg_logs = _average_logs(batch_logs)
@@ -1604,22 +1816,21 @@ def pretrain_with_cbtg(
             "epoch": epoch,
             "elapsed_train_time": time.perf_counter() - start,
             "use_dynamic_synthetic_agent": bool(dynamic_state is not None),
-            "dynamic_synthetic_refresh_epochs": 5,
-            "dynamic_synthetic_warmup_epochs": 4,
+            "dynamic_synthetic_refresh_epochs": refresh_epochs,
+            "dynamic_synthetic_warmup_epochs": warmup_epochs,
             "dynamic_synthetic_use_sampler": bool(getattr(config, "DYNAMIC_SYNTHETIC_USE_SAMPLER", True)),
             "dynamic_synthetic_use_loss_weight": bool(getattr(config, "DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT", True)),
             "dynamic_synthetic_top_ratio": 0.60,
-            "use_layerwise_finetune_lr": bool(getattr(config, "USE_LAYERWISE_FINETUNE_LR", False)),
-            "finetune_backbone_lr": float(getattr(config, "FINETUNE_BACKBONE_LR", config.LR)),
-            "finetune_head_lr": float(getattr(config, "FINETUNE_HEAD_LR", config.LR)),
-            "finetune_agent_lr": float(getattr(config, "FINETUNE_AGENT_LR", config.LR)),
-            "finetune_quality_agent_lr": float(getattr(config, "FINETUNE_QUALITY_AGENT_LR", getattr(config, "SYNTHETIC_AGENT_LR", config.LR))),
+            "synthetic_pretrain_lr": pretrain_lr,
+            "synthetic_agent_epochs": agent_epochs,
+            "synthetic_agent_update_active": update_quality_agent,
             **avg_logs,
             **refresh_logs,
         }
         append_csv(log_path, row)
         loss_value = avg_logs.get("synthetic_total_loss", avg_logs.get("total_loss", float("nan")))
         progress.set_postfix(loss=f"{loss_value:.4f}")
+    quality_agent.requires_grad_(True)
     ckpt_path = config.CHECKPOINT_DIR / "cbtg_pretrained_model.pth"
     torch.save(
         checkpoint_payload(
@@ -1631,7 +1842,8 @@ def pretrain_with_cbtg(
             synthetic_size=int(len(synthetic_bundle.frame)),
             synthetic_quality_agent_state_dict=quality_agent.state_dict(),
             dynamic_synthetic_agent=bool(dynamic_state is not None),
-            dynamic_synthetic_refresh_epochs=5,
+            dynamic_synthetic_refresh_epochs=refresh_epochs,
+            dynamic_synthetic_warmup_epochs=warmup_epochs,
             dynamic_synthetic_use_sampler=bool(getattr(config, "DYNAMIC_SYNTHETIC_USE_SAMPLER", True)),
             dynamic_synthetic_use_loss_weight=bool(getattr(config, "DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT", True)),
             dynamic_synthetic_top_ratio=0.60,
@@ -1671,6 +1883,7 @@ def _protocol_metrics(
         "Combined_Split_SHA256": str(data_bundle.combined_split_hash),
         "Source_Data_SHA256": str(data_bundle.source_sha256),
         "Synthetic_SHA256": str(synthetic_bundle.synthetic_sha256),
+        "Synthetic_Provenance_SHA256": str(synthetic_bundle.provenance_sha256),
         "Generation_Seed": int(getattr(config, "TABDIFF_GENERATION_SEED", 0)),
         "Config_SHA256": _config_sha256(required=require_config),
     }
@@ -1682,25 +1895,22 @@ def run_cbtg_pretraining(
     synthetic_epochs: int | None = None,
     finetune_real: bool = False,
     real_epochs: int | None = None,
+    cross_run_validation_stats: CrossRunValidationStats | None = None,
 ) -> tuple[torch.nn.Module, dict[str, float]]:
     if finetune_real:
         _config_sha256(required=True)
     ensure_dirs(config.CHECKPOINT_DIR, config.LOG_DIR, config.RESULT_DIR)
     save_split_artifacts(data_bundle, config.RESULT_DIR)
+    validation_stats = cross_run_validation_stats or load_cross_run_validation_stats(data_bundle)
     set_seed(config.SEED)
     device = resolve_device()
     model = build_experiment_model().to(device)
     quality_agent = build_synthetic_quality_agent(data_bundle, device)
     synthetic_bundle = _load_synthetic_bundle(data_bundle, synthetic_data_path)
     train_tensors = _train_tensor_bundle(data_bundle, device)
-    cluster_model = None
-    if (
-        bool(getattr(config, "USE_DYNAMIC_SYNTHETIC_AGENT", False))
-        or bool(getattr(config, "USE_CLUSTER_BALANCE_REWARD", False))
-    ):
-        x_train_np = data_bundle.train_loader.dataset.x.detach().cpu().numpy()
-        cluster_model = WorkingConditionCluster()
-        cluster_model.fit(x_train_np, data_bundle.y_train_raw)
+    x_train_np = data_bundle.train_loader.dataset.x.detach().cpu().numpy()
+    cluster_model = WorkingConditionCluster()
+    cluster_model.fit(x_train_np, data_bundle.y_train_raw)
     start = time.perf_counter()
     pretrain_ckpt = pretrain_with_cbtg(
         model,
@@ -1709,6 +1919,7 @@ def run_cbtg_pretraining(
         data_bundle,
         train_tensors,
         device,
+        validation_stats.metric_std,
         epochs=synthetic_epochs,
         cluster_model=cluster_model,
     )
@@ -1716,18 +1927,38 @@ def run_cbtg_pretraining(
     epochs_run = 0
     stopped_early = False
     if finetune_real:
+        real_agent_optimizer = AdamW(
+            quality_agent.parameters(),
+            lr=float(getattr(config, "FINETUNE_QUALITY_AGENT_LR", 1.0e-3)),
+            weight_decay=config.WEIGHT_DECAY,
+        )
+        real_agent_calibrator = partial(
+            calibrate_quality_agent_on_real,
+            optimizer=real_agent_optimizer,
+            cross_run_validation_std=validation_stats.metric_std,
+            cluster_model=cluster_model,
+        )
         _, best_epoch, epochs_run, stopped_early = supervised_finetune(
             model,
             data_bundle,
             device,
             epochs=real_epochs,
             freeze_backbone=bool(getattr(config, "FREEZE_FINETUNE_BACKBONE", False)),
+            quality_agent=quality_agent,
+            quality_agent_calibration_fn=real_agent_calibrator,
         )
         ckpt_path = config.CHECKPOINT_DIR / "best_model.pth"
         if ckpt_path.exists():
             load_checkpoint(model, ckpt_path, device)
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            agent_state = checkpoint.get("synthetic_quality_agent_state_dict")
+            if agent_state is None:
+                raise RuntimeError("Best checkpoint is missing the calibrated CBTG-Agent state.")
+            quality_agent.load_state_dict(agent_state)
 
+    assert_cross_run_validation_stats_current(validation_stats, data_bundle)
     metrics, collected = evaluate_model(model, data_bundle.test_loader, device, data_bundle)
+    assert_cross_run_validation_stats_current(validation_stats, data_bundle)
     metrics.update(
         {
             "total_params": count_trainable_parameters(model),
@@ -1744,6 +1975,10 @@ def run_cbtg_pretraining(
             "Train_Size": int(data_bundle.split_sizes.get("train", 0)),
             "Synthetic_Size": int(len(synthetic_bundle.frame)),
             "Synthetic_Pretrain_Checkpoint": str(pretrain_ckpt),
+            "CBTG_Cross_Run_Validation_Runs": int(validation_stats.num_runs),
+            "CBTG_Cross_Run_Validation_Stats": str(validation_stats.path),
+            "CBTG_Cross_Run_Validation_STD_SHA256": validation_stats.sha256,
+            "CBTG_Real_Calibrated": bool(finetune_real),
             "Seed": int(config.SEED),
             **_protocol_metrics(
                 data_bundle,

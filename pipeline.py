@@ -156,6 +156,7 @@ def load_config_overrides(path: str | None) -> None:
             "synthetic_agent_dropout": "SYNTHETIC_AGENT_DROPOUT",
             "synthetic_agent_epochs": "SYNTHETIC_AGENT_EPOCHS",
             "synthetic_agent_lr": "SYNTHETIC_AGENT_LR",
+            "cbtg_cross_run_validation_std_path": "CBTG_CROSS_RUN_VALIDATION_STD_PATH",
             "synthetic_confidence_threshold": "SYNTHETIC_CONFIDENCE_THRESHOLD",
             "synthetic_pretrain_confidence_threshold": "SYNTHETIC_PRETRAIN_CONFIDENCE_THRESHOLD",
             "synthetic_save_diagnostics": "SYNTHETIC_SAVE_DIAGNOSTICS",
@@ -310,6 +311,9 @@ def apply_cli_overrides(args: argparse.Namespace) -> None:
         "synthetic_agent_dropout": "SYNTHETIC_AGENT_DROPOUT",
         "synthetic_agent_epochs": "SYNTHETIC_AGENT_EPOCHS",
         "synthetic_agent_lr": "SYNTHETIC_AGENT_LR",
+        "cbtg_cross_run_validation_std_path": "CBTG_CROSS_RUN_VALIDATION_STD_PATH",
+        "scientific_code_sha256": "EXPECTED_SCIENTIFIC_CODE_SHA256",
+        "generation_protocol_sha256": "EXPECTED_GENERATION_PROTOCOL_SHA256",
         "synthetic_confidence_threshold": "SYNTHETIC_CONFIDENCE_THRESHOLD",
         "synthetic_pretrain_confidence_threshold": "SYNTHETIC_PRETRAIN_CONFIDENCE_THRESHOLD",
         "synthetic_process_consistency_threshold": "SYNTHETIC_PROCESS_CONSISTENCY_THRESHOLD",
@@ -489,6 +493,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synthetic_agent_dropout", type=float, default=None)
     parser.add_argument("--synthetic_agent_epochs", type=int, default=None)
     parser.add_argument("--synthetic_agent_lr", type=float, default=None)
+    parser.add_argument("--cbtg_cross_run_validation_std_path", default=None)
+    parser.add_argument("--scientific_code_sha256", default="")
+    parser.add_argument("--generation_protocol_sha256", default="")
     parser.add_argument("--synthetic_confidence_threshold", type=float, default=None)
     parser.add_argument("--synthetic_pretrain_confidence_threshold", type=float, default=None)
     parser.add_argument("--synthetic_process_consistency_threshold", type=float, default=None)
@@ -596,6 +603,8 @@ def run_generate_synthetic_tabdiff(args: argparse.Namespace) -> dict[str, object
         postprocess_result = postprocess_tabdiff_samples(
             checkpoint_path=train_result.get("checkpoint_path"),
             expected_checkpoint_sha256=train_result.get("checkpoint_sha256"),
+            expected_scientific_code_sha256=args.scientific_code_sha256 or None,
+            generation_protocol_sha256=args.generation_protocol_sha256 or None,
         )
     result = {
         "prepared": prepared,
@@ -673,6 +682,8 @@ def main() -> None:
                         str(config.SPLIT_METHOD),
                         int(getattr(config, "TABDIFF_GENERATION_SEED", 0)),
                         validate_current_generation_config=True,
+                        expected_scientific_code_sha256=args.scientific_code_sha256 or None,
+                        expected_generation_protocol_sha256=args.generation_protocol_sha256 or None,
                     )
                 except SyntheticProvenanceError as exc:
                     print(f"[Protocol] Existing synthetic data cannot be reused: {exc}")
@@ -708,6 +719,8 @@ def main() -> None:
             config.SYNTHETIC_DATA_PATH,
             data_bundle,
             int(getattr(config, "TABDIFF_GENERATION_SEED", 0)),
+            expected_scientific_code_sha256=args.scientific_code_sha256 or None,
+            expected_generation_protocol_sha256=args.generation_protocol_sha256 or None,
         )
 
         _, metrics = run_cbtg_pretraining(

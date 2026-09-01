@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ from protocol_integrity import (
     capture_file_snapshot,
     generation_config_snapshot,
     read_table_snapshot,
+    scientific_code_sha256,
     synthetic_provenance_path,
     validate_prepared_tabdiff_input,
 )
@@ -51,6 +53,13 @@ def _save_samples(df: pd.DataFrame, path: Path) -> None:
         raise ValueError(f"Unsupported output file type: {path.suffix}")
 
 
+def _normalized_sha256(value: str, name: str) -> str:
+    normalized = str(value).lower()
+    if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+        raise ValueError(f"{name} must be a SHA-256 value.")
+    return normalized
+
+
 def postprocess_tabdiff_samples(
     raw_path: str | Path | None = None,
     metadata_path: str | Path | None = None,
@@ -59,6 +68,8 @@ def postprocess_tabdiff_samples(
     require_label: bool = True,
     checkpoint_path: str | Path | None = None,
     expected_checkpoint_sha256: str | None = None,
+    expected_scientific_code_sha256: str | None = None,
+    generation_protocol_sha256: str | None = None,
 ) -> dict[str, object]:
     if checkpoint_path is None:
         raise RuntimeError("Postprocessing requires the checkpoint from the current TabDiff run.")
@@ -95,11 +106,32 @@ def postprocess_tabdiff_samples(
             f"metadata records {generation_seed}."
         )
     generation_config = generation_config_snapshot()
-    if canonical_sha256(generation_config) != metadata.get("generation_config_sha256"):
+    generation_config_hash = canonical_sha256(generation_config)
+    if generation_config_hash != metadata.get("generation_config_sha256"):
         raise RuntimeError(
             "TabDiff generation settings changed after data preparation. "
             "Prepare and generate the synthetic data again."
         )
+    current_code_hash = scientific_code_sha256()
+    if expected_scientific_code_sha256 is not None:
+        expected_code_hash = _normalized_sha256(
+            expected_scientific_code_sha256,
+            "expected_scientific_code_sha256",
+        )
+        if current_code_hash != expected_code_hash:
+            raise RuntimeError("Scientific source code changed during TabDiff generation.")
+    generation_protocol_hash = (
+        _normalized_sha256(generation_protocol_sha256, "generation_protocol_sha256")
+        if generation_protocol_sha256 is not None
+        else canonical_sha256(
+            {
+                "format": "mtam_hg_standalone_generation_protocol_v1",
+                "scientific_code_sha256": current_code_hash,
+                "config_sha256": str(getattr(config, "CONFIG_SHA256", "") or ""),
+                "generation_config_sha256": generation_config_hash,
+            }
+        )
+    )
 
     raw_snapshot = read_table_snapshot(raw_file)
     df = raw_snapshot.frame.copy()
@@ -168,6 +200,8 @@ def postprocess_tabdiff_samples(
     with notes_path.open("w", encoding="utf-8") as f:
         json.dump(notes, f, indent=2, ensure_ascii=False)
     provenance_path = synthetic_provenance_path(out_file)
+    if not isinstance(metadata, ValidatedPreparedInput):
+        raise RuntimeError("Prepared TabDiff metadata was not validated.")
     provenance = {
         "format": PROVENANCE_FORMAT,
         "source": {
@@ -190,8 +224,16 @@ def postprocess_tabdiff_samples(
             "backend_seed": TABDIFF_DETERMINISTIC_SEED,
             "deterministic": True,
             "config": generation_config,
-            "config_sha256": canonical_sha256(generation_config),
-            "prepared_csv_sha256": str(metadata["prepared_train_csv_sha256"]),
+            "config_sha256": generation_config_hash,
+            "scientific_code_sha256": current_code_hash,
+            "protocol_sha256": generation_protocol_hash,
+            "metadata_path": str(metadata.metadata_snapshot.path),
+            "metadata_sha256": metadata.metadata_snapshot.sha256,
+            "prepared_csv_path": str(metadata.prepared_snapshot.path),
+            "prepared_csv_sha256": metadata.prepared_snapshot.sha256,
+            "tabdiff_input_csv_path": str(metadata.repo_snapshot.path),
+            "tabdiff_input_csv_sha256": metadata.repo_snapshot.sha256,
+            "raw_samples_path": str(raw_snapshot.file.path),
             "raw_samples_sha256": raw_snapshot.file.sha256,
             "checkpoint_path": str(checkpoint_snapshot.path),
             "checkpoint_sha256": checkpoint_hash,
@@ -239,6 +281,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generation_condition", default="")
     parser.add_argument("--checkpoint_path", default="")
     parser.add_argument("--checkpoint_sha256", default="")
+    parser.add_argument("--scientific_code_sha256", default="")
+    parser.add_argument("--generation_protocol_sha256", default="")
     parser.add_argument("--allow_missing_label", action="store_true")
     return parser
 
@@ -253,6 +297,8 @@ def main() -> None:
         require_label=not args.allow_missing_label,
         checkpoint_path=args.checkpoint_path or None,
         expected_checkpoint_sha256=args.checkpoint_sha256 or None,
+        expected_scientific_code_sha256=args.scientific_code_sha256 or None,
+        generation_protocol_sha256=args.generation_protocol_sha256 or None,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 

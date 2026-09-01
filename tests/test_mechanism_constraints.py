@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from sklearn.preprocessing import QuantileTransformer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TABDIFF_ROOT = PROJECT_ROOT / "third_party" / "TabDiff"
@@ -14,6 +15,8 @@ for path in (PROJECT_ROOT, TABDIFF_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import tabdiff.trainer as trainer_module  # noqa: E402
+from tabdiff.main import validate_trainable_scope  # noqa: E402
 from tabdiff.models.capl_mechanism import (  # noqa: E402
     CAPLMechanismConstraint,
     CAPLMechanismWeights,
@@ -52,13 +55,18 @@ def _paper_constraint(*, yield_tolerance: float = 5.0) -> CAPLMechanismConstrain
     raw[:, PAPER_COLUMNS.index("HF_T")] = rng.normal(810.0, 8.0, len(raw))
     raw[:, PAPER_COLUMNS.index("SF_T")] = rng.normal(815.0, 8.0, len(raw))
     raw[:, PAPER_COLUMNS.index("SC_T")] = rng.normal(650.0, 8.0, len(raw))
-    transformed = (raw - raw.mean(axis=0, keepdims=True)) / np.clip(
-        raw.std(axis=0, keepdims=True), 1.0e-6, None
+    transformer = QuantileTransformer(
+        n_quantiles=len(raw),
+        output_distribution="normal",
+        random_state=0,
     )
+    transformed = transformer.fit_transform(raw).astype(np.float32)
     return CAPLMechanismConstraint(
         PAPER_COLUMNS,
         transformed,
         raw,
+        quantile_values=transformer.quantiles_,
+        quantile_references=transformer.references_,
         low_quantile=0.0,
         high_quantile=1.0,
         margin=0.0,
@@ -80,26 +88,34 @@ def test_mechanism_exposes_exactly_the_three_paper_terms() -> None:
     ]
 
 
-def test_temperature_path_maps_the_single_soaking_feature_to_both_endpoints() -> None:
+def test_temperature_path_uses_four_consecutive_furnace_measurements() -> None:
     constraint = _paper_constraint()
     name_to_idx = {name: idx for idx, name in enumerate(PAPER_COLUMNS)}
 
     assert constraint.temperature_hold_tolerance == pytest.approx(10.0)
     assert constraint.temperature_paths == [
         (
+            name_to_idx["JPF_PT"],
             name_to_idx["HF_T"],
-            name_to_idx["SF_T"],
             name_to_idx["SF_T"],
             name_to_idx["SC_T"],
         )
     ]
+    assert CAPLMechanismConstraint.TEMPERATURE_PATH_COLUMNS == (
+        "JPF_PT",
+        "HF_T",
+        "SF_T",
+        "SC_T",
+    )
+    assert len(set(constraint.temperature_paths[0])) == 4
 
     physical = constraint.raw_mean.unsqueeze(0).clone()
-    physical[:, name_to_idx["HF_T"]] = 820.0
-    physical[:, name_to_idx["SF_T"]] = 800.0
-    physical[:, name_to_idx["SC_T"]] = 815.0
+    physical[:, name_to_idx["JPF_PT"]] = 820.0
+    physical[:, name_to_idx["HF_T"]] = 800.0
+    physical[:, name_to_idx["SF_T"]] = 815.0
+    physical[:, name_to_idx["SC_T"]] = 825.0
 
-    assert constraint.temperature_path_energy(physical).item() == pytest.approx(625.0)
+    assert constraint.temperature_path_energy(physical).item() == pytest.approx(525.0)
 
 
 def test_production_window_excludes_generated_yield_strength() -> None:
@@ -149,11 +165,42 @@ def test_forward_is_weighted_sum_of_only_the_three_terms() -> None:
     constraint = _paper_constraint()
     transformed = torch.zeros(4, len(PAPER_COLUMNS))
 
-    parts = constraint.energy_parts_from_physical(constraint.proxy_to_physical(transformed))
+    parts = constraint.energy_parts_from_physical(constraint.to_physical(transformed))
     expected = sum(parts.values())
 
     assert torch.allclose(constraint(transformed, reduce=False), expected)
     assert torch.isfinite(expected).all()
+
+
+def test_quantile_inverse_matches_the_fitted_sklearn_transformer_and_is_differentiable() -> None:
+    rng = np.random.default_rng(23)
+    raw = rng.lognormal(mean=2.0, sigma=0.7, size=(96, len(PAPER_COLUMNS))).astype(np.float32)
+    transformer = QuantileTransformer(
+        n_quantiles=32,
+        output_distribution="normal",
+        random_state=0,
+    )
+    transformed_train = transformer.fit_transform(raw).astype(np.float32)
+    constraint = CAPLMechanismConstraint(
+        PAPER_COLUMNS,
+        transformed_train,
+        raw,
+        quantile_values=transformer.quantiles_,
+        quantile_references=transformer.references_,
+    )
+    query = rng.normal(0.0, 0.8, size=(7, len(PAPER_COLUMNS))).astype(np.float32)
+    query[0] = -8.0
+    query[-1] = 8.0
+    transformed = torch.tensor(query, dtype=torch.float32, requires_grad=True)
+
+    physical = constraint.to_physical(transformed)
+    expected = transformer.inverse_transform(transformed.detach().numpy())
+
+    np.testing.assert_allclose(physical.detach().numpy(), expected, rtol=2.0e-5, atol=2.0e-5)
+    physical.sum().backward()
+    assert transformed.grad is not None
+    assert torch.isfinite(transformed.grad).all()
+    assert torch.count_nonzero(transformed.grad).item() > 0
 
 
 def test_missing_paper_temperature_column_fails_fast() -> None:
@@ -161,4 +208,75 @@ def test_missing_paper_temperature_column_fails_fast() -> None:
     raw = np.ones((8, len(columns)), dtype=np.float32)
 
     with pytest.raises(ValueError, match="slow-cooling-furnace"):
-        CAPLMechanismConstraint(columns, raw, raw)
+        references = np.linspace(0.0, 1.0, len(raw), dtype=np.float32)
+        CAPLMechanismConstraint(
+            columns,
+            raw,
+            raw,
+            quantile_values=np.sort(raw, axis=0),
+            quantile_references=references,
+        )
+
+
+def test_partial_tabdiff_scope_requires_a_pretrained_checkpoint() -> None:
+    with pytest.raises(ValueError, match="pretrained checkpoint"):
+        validate_trainable_scope("mlp_detokenizer", None)
+
+    validate_trainable_scope("all", None)
+    validate_trainable_scope("mlp_detokenizer", "base.pt")
+
+
+def test_finetune_checkpoint_initializes_model_and_ema_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class Diffusion(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self._denoise_fn = torch.nn.Linear(2, 2)
+            self.num_schedule = torch.nn.Linear(1, 1)
+            self.cat_schedule = torch.nn.Linear(1, 1)
+
+    source = Diffusion()
+    with torch.no_grad():
+        for parameter in source.parameters():
+            parameter.fill_(3.0)
+    checkpoint = tmp_path / "base.pt"
+    torch.save(
+        {
+            "denoise_fn": source._denoise_fn.state_dict(),
+            "num_schedule": source.num_schedule.state_dict(),
+            "cat_schedule": source.cat_schedule.state_dict(),
+        },
+        checkpoint,
+    )
+    monkeypatch.setattr(trainer_module, "ReduceLROnPlateau", lambda *_args, **_kwargs: object())
+
+    trainer = trainer_module.Trainer(
+        Diffusion(),
+        train_iter=[],
+        dataset=None,
+        test_dataset=None,
+        metrics=None,
+        logger=None,
+        lr=1.0e-4,
+        weight_decay=0.0,
+        steps=500,
+        batch_size=8,
+        check_val_every=500,
+        sample_batch_size=8,
+        model_save_path=str(tmp_path / "ckpt"),
+        result_save_path=str(tmp_path / "result"),
+        ckpt_path=checkpoint,
+        device=torch.device("cpu"),
+        reset_train_epoch=True,
+    )
+
+    for loaded, ema in (
+        (trainer.diffusion._denoise_fn, trainer.ema_model),
+        (trainer.diffusion.num_schedule, trainer.ema_num_schedule),
+        (trainer.diffusion.cat_schedule, trainer.ema_cat_schedule),
+    ):
+        for loaded_parameter, ema_parameter in zip(loaded.parameters(), ema.parameters()):
+            assert torch.all(loaded_parameter == 3.0)
+            assert torch.equal(loaded_parameter, ema_parameter)

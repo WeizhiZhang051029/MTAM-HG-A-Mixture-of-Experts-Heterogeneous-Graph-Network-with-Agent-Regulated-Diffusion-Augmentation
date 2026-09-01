@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,7 +12,9 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 import config
+import train as train_module
 from dataset import CAPLDataset
+from losses import total_loss
 from training.cbtg import (
     AGENT_FEEDBACK_FEATURE_NAMES,
     PAPER_CBTG_LAMBDA_H,
@@ -26,9 +29,14 @@ from training.cbtg import (
     _synthetic_step,
     build_dynamic_synthetic_state,
     build_paper_cbtg_feedback,
+    build_synthetic_pretrain_optimizer,
+    calibrate_quality_agent_on_real,
     compute_dynamic_synthetic_weights,
+    dynamic_synthetic_refresh_due,
     evaluate_validation_pretrain_feedback,
+    load_cross_run_validation_stats,
     paper_cbtg_agent_loss,
+    quality_agent_updates_enabled,
     select_top_synthetic_indices,
 )
 from training.clusters import WorkingConditionCluster
@@ -57,7 +65,10 @@ def test_protocol_metrics_bind_split_source_and_synthetic_fingerprints() -> None
         combined_split_hash="a" * 64,
         source_sha256="b" * 64,
     )
-    synthetic = SimpleNamespace(synthetic_sha256="c" * 64)
+    synthetic = SimpleNamespace(
+        synthetic_sha256="c" * 64,
+        provenance_sha256="e" * 64,
+    )
     original_seed = getattr(config, "TABDIFF_GENERATION_SEED", 0)
     original_config_hash = getattr(config, "CONFIG_SHA256", "")
     config.TABDIFF_GENERATION_SEED = 0
@@ -74,6 +85,7 @@ def test_protocol_metrics_bind_split_source_and_synthetic_fingerprints() -> None
         "Combined_Split_SHA256": "a" * 64,
         "Source_Data_SHA256": "b" * 64,
         "Synthetic_SHA256": "c" * 64,
+        "Synthetic_Provenance_SHA256": "e" * 64,
         "Generation_Seed": 0,
         "Config_SHA256": "d" * 64,
     }
@@ -180,7 +192,7 @@ def test_initial_warmup_keeps_all_candidates_instead_of_first_sixty_percent() ->
     )
     data = SimpleNamespace(y_train_raw=np.arange(n, dtype=np.float64))
 
-    state = build_dynamic_synthetic_state(synthetic, data)
+    state = build_dynamic_synthetic_state(synthetic, data, np.zeros(5, dtype=np.float64))
 
     assert state.selected_indices.tolist() == list(range(n))
     assert state.selected_mask.all()
@@ -207,8 +219,11 @@ class _TwoClusters:
     def predict(self, x: np.ndarray) -> np.ndarray:
         return (np.asarray(x)[:, 0] >= 5.0).astype(np.int64)
 
+    def predict_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.from_numpy(self.predict(x.detach().cpu().numpy())).long()
 
-def test_dynamic_feedback_reads_validation_rows_and_tracks_refresh_std() -> None:
+
+def test_dynamic_feedback_uses_injected_cross_run_validation_std() -> None:
     x = np.array([[1.0], [2.0], [10.0], [20.0]], dtype=np.float32)
     dataset = CAPLDataset(x, x.copy(), np.arange(4))
     data = SimpleNamespace(
@@ -216,24 +231,252 @@ def test_dynamic_feedback_reads_validation_rows_and_tracks_refresh_std() -> None
         y_scaler=_IdentityScaler(),
         tail_thresholds=(2.0, 10.0),
     )
-    state = _state(4, np.array([0, 0, 1, 1], dtype=np.int64))
     model = _ScaleModel(1.0)
+    run_std = np.array([0.2, 0.1, 0.3, 0.01, 0.4], dtype=np.float64)
     original_standardize = config.STANDARDIZE_Y
     config.STANDARDIZE_Y = True
     try:
         first = evaluate_validation_pretrain_feedback(
-            model, data, state, torch.device("cpu"), cluster_model=_TwoClusters()
+            model, data, torch.device("cpu"), run_std, cluster_model=_TwoClusters()
         )
         model.scale.data.fill_(0.5)
         second = evaluate_validation_pretrain_feedback(
-            model, data, state, torch.device("cpu"), cluster_model=_TwoClusters()
+            model, data, torch.device("cpu"), run_std, cluster_model=_TwoClusters()
         )
     finally:
         config.STANDARDIZE_Y = original_standardize
 
     assert np.allclose(first["overall_metrics"], 0.0, atol=1.0e-10)
-    assert np.any(np.asarray(second["run_std"]) > 0.0)
-    assert len(state.validation_metric_history) == 2
+    assert np.allclose(first["run_std"], run_std)
+    assert np.allclose(second["run_std"], run_std)
+    assert np.any(np.asarray(second["overall_metrics"]) > 0.0)
+
+
+def test_cross_run_validation_stats_require_independent_matching_split(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "validation_std.json"
+    run_metrics = [
+        [float(seed), float(seed + 1), float(seed + 2), seed / 100.0, float(seed + 3)]
+        for seed in range(10)
+    ]
+    path.write_text(
+        json.dumps(
+            {
+                "format": "mtam_hg_cbtg_cross_run_v1",
+                "source": "independent_validation_runs",
+                "partition": "validation",
+                "ddof": 1,
+                "metric_names": ["RMSE", "MAE", "MAPE", "ONE_MINUS_R2", "TAIL_MAE"],
+                "validation_metric_std": np.std(run_metrics, axis=0, ddof=1).tolist(),
+                "num_runs": 10,
+                "combined_split_sha256": "a" * 64,
+                "source_data_sha256": "c" * 64,
+                "config_sha256": "b" * 64,
+                "producer_protocol_sha256": "d" * 64,
+                "runs": [
+                    {
+                        "metrics_artifact_sha256": f"{index:064x}",
+                        "validation_metrics": metrics,
+                    }
+                    for index, metrics in enumerate(run_metrics, start=1)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_SHA256", "b" * 64)
+    stats = load_cross_run_validation_stats(
+        SimpleNamespace(combined_split_hash="a" * 64, source_sha256="c" * 64),
+        path,
+    )
+
+    assert stats.num_runs == 10
+    assert np.allclose(stats.metric_std, np.std(run_metrics, axis=0, ddof=1))
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["source"] = "refresh_epochs"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="independent validation runs"):
+        load_cross_run_validation_stats(
+            SimpleNamespace(combined_split_hash="a" * 64, source_sha256="c" * 64),
+            path,
+        )
+
+
+def test_synthetic_pretrain_optimizer_uses_one_paper_learning_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "LR", 1.0e-3)
+    monkeypatch.setattr(config, "SYNTHETIC_AGENT_LR", 1.0e-3)
+    optimizer = build_synthetic_pretrain_optimizer(_ScaleModel(), _QualityAgent())
+
+    assert {group["lr"] for group in optimizer.param_groups} == {1.0e-3}
+
+    monkeypatch.setattr(config, "SYNTHETIC_AGENT_LR", 5.0e-4)
+    with pytest.raises(ValueError, match="same pretraining learning rate"):
+        build_synthetic_pretrain_optimizer(_ScaleModel(), _QualityAgent())
+
+
+def test_agent_epoch_configuration_controls_updates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "SYNTHETIC_AGENT_EPOCHS", 100)
+
+    assert quality_agent_updates_enabled(100)
+    assert not quality_agent_updates_enabled(101)
+
+
+def test_dynamic_refresh_honors_five_complete_warmup_epochs() -> None:
+    assert not any(dynamic_synthetic_refresh_due(epoch, 5, 5) for epoch in range(1, 6))
+    assert dynamic_synthetic_refresh_due(6, 5, 5)
+    assert not dynamic_synthetic_refresh_due(10, 5, 5)
+    assert dynamic_synthetic_refresh_due(11, 5, 5)
+
+
+def test_cbtg_real_calibration_disables_batch_error_router_reward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    y = torch.tensor([[1.0], [2.0]])
+    mu = torch.tensor([[0.5], [2.5]], requires_grad=True)
+    outputs = {
+        "mu": mu,
+        "expert_preds": torch.stack((mu - 0.1, mu + 0.1), dim=1),
+        "gate_probs": torch.full((2, 2), 0.5),
+        "sample_confidence": torch.full((2, 1), 0.6, requires_grad=True),
+        "aux_loss": mu.new_tensor(0.0),
+    }
+    monkeypatch.setattr(config, "USE_AGENT_REWARD", True)
+    monkeypatch.setattr(config, "USE_LAPLACE", False)
+    monkeypatch.setattr(config, "EXPERT_CALIBRATION_LAMBDA", 0.0)
+    monkeypatch.setattr(config, "EXPERT_DIVERSITY_LAMBDA", 0.0)
+    monkeypatch.setattr(config, "AGENT_USE_SAMPLE_WEIGHT_FOR_SUPERVISED_LOSS", True)
+    external_weights = torch.tensor([[1.0], [0.0]])
+
+    loss, logs = total_loss(
+        outputs,
+        y,
+        batch_weights=external_weights,
+        use_internal_agent_weight=False,
+        use_agent_reward=False,
+    )
+    loss.backward()
+
+    assert logs["agent_reward_loss"] == 0.0
+    assert logs["pred_loss"] == pytest.approx(0.125)
+    assert logs["batch_weight_mean"] == pytest.approx(0.5)
+    assert outputs["sample_confidence"].grad is None
+
+
+def test_real_domain_calibration_updates_quality_agent_without_test_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x = np.array([[1.0], [2.0], [10.0], [20.0]], dtype=np.float32)
+    dataset = CAPLDataset(x, x.copy(), np.arange(4))
+    data = SimpleNamespace(
+        train_loader=DataLoader(dataset, batch_size=2, shuffle=False),
+        val_loader=DataLoader(dataset, batch_size=2, shuffle=False),
+        y_scaler=_IdentityScaler(),
+        tail_thresholds=(2.0, 10.0),
+    )
+    model = _ScaleModel(0.5)
+    agent = _QualityAgent()
+    optimizer = AdamW(agent.parameters(), lr=1.0e-3)
+    before = agent.logit.detach().clone()
+    monkeypatch.setattr(config, "STANDARDIZE_Y", True)
+
+    logs, batch_weight_fn = calibrate_quality_agent_on_real(
+        model,
+        agent,
+        data,
+        torch.device("cpu"),
+        1,
+        optimizer=optimizer,
+        cross_run_validation_std=np.array([0.2, 0.1, 0.3, 0.01, 0.4]),
+        cluster_model=_TwoClusters(),
+    )
+
+    assert np.isfinite(logs["real_cbtg_agent_loss"])
+    assert logs["real_cbtg_validation_tail_mae"] > 0.0
+    assert not torch.equal(before, agent.logit.detach())
+    weights = batch_weight_fn(dataset.x[:2], dataset.y[:2])
+    assert weights.shape == (2, 1)
+    assert not weights.requires_grad
+
+
+def test_real_finetune_calibrates_agent_before_weighted_model_epoch(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    model = _ScaleModel(0.5)
+    agent = _QualityAgent()
+    dataset = CAPLDataset(
+        np.array([[1.0], [2.0]], dtype=np.float32),
+        np.array([[1.0], [2.0]], dtype=np.float32),
+        np.arange(2),
+    )
+    data = SimpleNamespace(
+        train_loader=DataLoader(dataset, batch_size=2, shuffle=False),
+        val_loader=DataLoader(dataset, batch_size=2, shuffle=False),
+    )
+
+    def calibrate(*_args):
+        events.append("calibrate")
+
+        def weights(x: torch.Tensor, _y: torch.Tensor) -> torch.Tensor:
+            events.append("weight")
+            return torch.ones((len(x), 1), device=x.device)
+
+        return {"real_cbtg_agent_loss": 0.1}, weights
+
+    def train_epoch(*_args, **kwargs):
+        assert kwargs["use_internal_agent_weight"] is False
+        assert kwargs["use_agent_reward"] is False
+        kwargs["batch_weight_fn"](dataset.x, dataset.y)
+        events.append("train")
+        return {"total_loss": 0.2, "pred_loss": 0.2}
+
+    monkeypatch.setattr(train_module, "save_split_artifacts", lambda *_args: None)
+    monkeypatch.setattr(train_module, "maybe_enable_mr_lora", lambda *_args, **_kwargs: {"enabled": False})
+    monkeypatch.setattr(
+        train_module,
+        "configure_finetune_trainability",
+        lambda *_args, **_kwargs: {
+            "freeze_backbone": False,
+            "trainable_params": 1,
+            "frozen_params": 0,
+        },
+    )
+    monkeypatch.setattr(train_module, "save_json", lambda *_args: None)
+    monkeypatch.setattr(
+        train_module,
+        "build_finetune_optimizer",
+        lambda current_model: AdamW(current_model.parameters(), lr=1.0e-3),
+    )
+    monkeypatch.setattr(train_module, "train_one_epoch", train_epoch)
+    monkeypatch.setattr(
+        train_module,
+        "evaluate_model",
+        lambda *_args: ({"RMSE": 1.0, "MAE": 1.0, "TAIL_MAE": 1.0}, {}),
+    )
+    monkeypatch.setattr(train_module, "evaluate_prediction_loss", lambda *_args: 1.0)
+    monkeypatch.setattr(train_module, "append_csv", lambda *_args: None)
+    monkeypatch.setattr(train_module, "checkpoint_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(config, "USE_CLUSTER_BALANCE_REWARD", False)
+    monkeypatch.setattr(config, "CHECKPOINT_DIR", tmp_path)
+    monkeypatch.setattr(config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(config, "RESULT_DIR", tmp_path)
+
+    train_module.supervised_finetune(
+        model,
+        data,
+        torch.device("cpu"),
+        epochs=1,
+        quality_agent=agent,
+        quality_agent_calibration_fn=calibrate,
+    )
+
+    assert events == ["calibrate", "weight", "train"]
 
 
 def test_working_condition_labels_are_ordered_by_training_mean_yield_strength() -> None:
