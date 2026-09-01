@@ -211,43 +211,65 @@ python run_experiment.py --dry_run
 
 ```text
 MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Diffusion-Augmentation/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 ├── configs/
 │   └── mtam_hg.yaml
-├── data/
-│   └── README.md
 ├── generation/
-│   └── MP-TabDiff related modules
+│   ├── prepare.py
+│   ├── train.py
+│   ├── sample.py
+│   ├── postprocess.py
+│   └── tabdiff.py
 ├── images/
 │   ├── framework.jpg
 │   ├── mp-tabdiff.jpg
 │   ├── cbtg-agent.jpg
 │   └── moe-ipohgn.jpg
 ├── models/
-│   └── IPOHGN experts, HSG, and LoRA modules
+│   ├── graph_structure.py
+│   ├── ipohgn.py
+│   ├── mr_lora.py
+│   └── mtam_hg.py
 ├── scripts/
 │   └── audit_release.py
 ├── tests/
-│   └── implementation and reproducibility tests
+│   └── test_*.py
 ├── third_party/
 │   └── TabDiff/
 ├── training/
-│   └── CBTG-Agent and training procedures
+│   ├── cbtg.py
+│   └── clusters.py
 ├── utils/
-│   └── graph, logging, and reproducibility utilities
+│   ├── graph.py
+│   ├── logger.py
+│   └── seed.py
 ├── config.py
+├── config_loader.py
 ├── dataset.py
+├── evaluate.py
+├── losses.py
+├── metrics.py
 ├── pipeline.py
+├── protocol.py
+├── protocol_integrity.py
 ├── run_experiment.py
+├── train.py
+├── pyproject.toml
+├── requirements.txt
 └── README.md
 ```
 
 The main components are organized as follows:
 
-* `generation/`: MP-TabDiff preparation, training, and synthetic-sample generation
-* `models/`: heterogeneous graph experts, sparse routing, and real-domain adaptation
-* `training/`: CBTG-Agent and two-stage optimization
-* `utils/`: graph construction, logging, and reproducibility utilities
-* `tests/`: implementation checks and paper-protocol validation
+- `run_experiment.py`: locked entry point for the ten-run main experiment
+- `generation/`: MP-TabDiff preparation, training, sampling, and provenance-checked postprocessing
+- `models/`: graph structure learning, IPOHGN experts, sparse routing, and MR-LoRA adaptation
+- `training/`: CBTG-Agent optimization and working-condition cluster balancing
+- `protocol.py` and `protocol_integrity.py`: experiment-contract validation and artifact-integrity checks
+- `pipeline.py`, `train.py`, and `evaluate.py`: command-line orchestration, model training, and evaluation
+- `tests/`: model, training, protocol, integrity, and reproducibility checks
 
 ---
 
