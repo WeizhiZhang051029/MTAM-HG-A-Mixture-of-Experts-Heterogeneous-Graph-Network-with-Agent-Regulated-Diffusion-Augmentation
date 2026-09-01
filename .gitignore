@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+.venv_tabdiff/
+
+# Local outputs and model artifacts
+outputs/
+output/
+logs/
+checkpoints/
+figures/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+*.joblib
+*.sav
+*.h5
+*.hdf5
+*.onnx
+*.npy
+*.npz
+*.zip
+*.7z
+
+# Internal planning / audit documents
+docs/audits/
+
+# Vendored TabDiff runtime artifacts
+third_party/TabDiff/.git/
+third_party/TabDiff/debug/
+third_party/TabDiff/synthetic/
+third_party/TabDiff/data/
+third_party/TabDiff/**/ckpt/
+third_party/TabDiff/**/result/
+
+# Private CAPL data and every generated table. Only the data contract is public.
+data/**
+!data/.gitkeep
+*.xlsx
+*.xls
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.provenance.json
+*.postprocess.json
+
+# Logs and temporary files
+*.log
+*.out
+*.err
+*.tmp
+*.bak
+*.bak_*
+MANIFEST_upload_summary.txt
+.codex_sync_backups/
+
+# Credentials and host-specific launchers
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+scripts/*remote*.py
+_launch_*.sh
+_check_*status*.sh
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,100 @@
+experiment_name: mtam_hg
+output_base: outputs/mtam_hg
+model_seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
+split_seed: 42
+split_method: stratified_random
+generation_seed: 0
+
+use_tabdiff_generation: true
+tabdiff_repo_path: third_party/TabDiff
+tabdiff_data_dir: data/tabdiff
+tabdiff_output_dir: outputs/tabdiff
+tabdiff_dataname: capl
+tabdiff_exp_name: capl_mtamhg
+tabdiff_num_samples: 5000
+tabdiff_mechanism_constraint: true
+tabdiff_mechanism_lambda: 0.05
+tabdiff_guidance_scale: 0.05
+tabdiff_mechanism_temperature_hold_tolerance: 10.0
+tabdiff_mechanism_yield_tolerance: 0.0
+tabdiff_trainable_scope: mlp_detokenizer
+tabdiff_min_save_epoch: 1
+tabdiff_finetune_lr: 0.0001
+tabdiff_finetune_steps: 500
+tabdiff_num_timesteps_override: 50
+tabdiff_stochastic_sampler: true
+
+use_synthetic_pretrain: true
+synthetic_data_path: data/synthetic_CAPL_ma_tabdiff.xlsx
+synthetic_label_col: 屈服强度
+synthetic_pretrain_epochs: 100
+synthetic_batch_size: 32
+synthetic_use_agent_weight: true
+synthetic_use_reward_loss: true
+synthetic_agent_hidden_dim: 128
+synthetic_agent_attention_dim: 64
+synthetic_agent_attention_heads: 4
+synthetic_agent_dropout: 0.2
+synthetic_agent_epochs: 20
+synthetic_agent_lr: 0.001
+synthetic_pretrain_confidence_threshold: 0.0
+use_dynamic_synthetic_agent: true
+dynamic_synthetic_refresh_epochs: 5
+dynamic_synthetic_warmup_epochs: 5
+dynamic_synthetic_use_sampler: true
+dynamic_synthetic_use_loss_weight: true
+dynamic_synthetic_top_ratio: 0.60
+dynamic_synthetic_process_power: 1.0
+dynamic_synthetic_mechanism_power: 1.0
+use_cluster_balance_reward: true
+num_working_condition_clusters: 5
+cluster_balance_lambda: 0.3
+reward_alpha_cluster: 0.3
+
+num_experts: 4
+top_k: 2
+graph_backbone_layers: 2
+weight_decay: 0.001
+epochs: 50
+early_stopping_patience: 5
+dropout: 0.2
+min_delta: 0.0
+tail_threshold_mode: train_quantile
+tail_quantile_low: 0.1
+tail_quantile_high: 0.9
+checkpoint_selection_metric: rmse
+checkpoint_tail_mae_lambda: 0.0
+expert_calibration_lambda: 0.03
+expert_diversity_lambda: 0.001
+
+use_layerwise_finetune_lr: true
+finetune_backbone_lr: 0.0001
+finetune_head_lr: 0.0005
+finetune_agent_lr: 0.001
+finetune_quality_agent_lr: 0.001
+freeze_finetune_backbone: true
+use_mr_lora: true
+mr_lora_scope: graph_attention_routing
+mr_lora_rank_graph: 8
+mr_lora_rank_routing: 4
+mr_lora_alpha_graph: 16.0
+mr_lora_alpha_routing: 8.0
+mr_lora_dropout: 0.05
+mr_lora_train_output_head: false
+
+cli:
+  moe_aux_lambda: 0.2
+  hidden_dim: 64
+  no_laplace: true
+  agent_hidden_dim: 128
+  agent_dropout: 0.2
+  agent_use_expert_preds: true
+  agent_use_uncertainty: true
+  agent_output_sample_confidence: true
+  agent_reliability_routing_lambda: 1.0
+  use_agent_reward: true
+  agent_reward_lambda: 0.01
+  target_confidence_mean: 0.6
+  confidence_mean_reg_lambda: 0.01
+  confidence_entropy_reg_lambda: 0.001
+  use_confidence_weighted_supervised_loss: true

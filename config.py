@@ -1,0 +1,347 @@
+"""MTAM-HG experiment configuration."""
+
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+LOG_DIR = OUTPUT_DIR / "logs"
+RESULT_DIR = OUTPUT_DIR / "results"
+SCALER_PATH = OUTPUT_DIR / "scaler.pkl"
+
+
+NODE_NAMES = [
+    "FS", "JPF_PT", "HF_T", "SF_T", "SC_T", "FC1_T", "OA_T", "FC2_T", "Q_T",
+    "EL", "RF", "BF", "HT", "FRT", "CT", "ATh", "AWd", "CRR", "C", "Mn", "S", "P",
+]
+
+NODE_TYPE_MAP = {
+    "FS": "operating",
+    "RF": "operating",
+    "BF": "operating",
+
+    "JPF_PT": "procedure",
+    "HF_T": "procedure",
+    "SF_T": "procedure",
+    "SC_T": "procedure",
+    "FC1_T": "procedure",
+    "OA_T": "procedure",
+    "FC2_T": "procedure",
+    "Q_T": "procedure",
+    "HT": "procedure",
+    "FRT": "procedure",
+    "CT": "procedure",
+    "CRR": "procedure",
+
+    "ATh": "conditional",
+    "AWd": "conditional",
+    "C": "conditional",
+    "Mn": "conditional",
+    "S": "conditional",
+    "P": "conditional",
+
+    "EL": "result",
+    "YS_VIRTUAL": "result",
+}
+
+NODE_TYPES = ["operating", "procedure", "conditional", "result"]
+NODE_TYPE_TO_ID = {name: idx for idx, name in enumerate(NODE_TYPES)}
+
+USE_VIRTUAL_QUALITY_NODE = False
+VIRTUAL_QUALITY_NODE_NAME = "YS_VIRTUAL"
+QUALITY_STAGE_NAME = "stage4_quality_readout"
+
+PROCESS_STAGE_NODE_MAP = {
+    "stage1_composition_hotrolling": ["C", "Mn", "S", "P", "HT", "FRT", "CT"],
+    "stage2_coldrolling_deformation": ["RF", "BF", "ATh", "AWd", "CRR"],
+    "stage3_annealing_thermal": ["FS", "JPF_PT", "HF_T", "SF_T", "SC_T", "FC1_T", "OA_T", "FC2_T", "Q_T"],
+}
+
+PROCESS_ORDER_NODE_MAP = {
+    "order00_material_entry": ["C", "Mn", "S", "P", "ATh", "AWd"],
+    "order01_uncoiler_welding_entry_looper": ["FS"],
+    "order02_jpf_preheating": ["JPF_PT"],
+    "order03_heating_furnace": ["HF_T", "HT"],
+    "order04_soaking_furnace": ["SF_T"],
+    "order05_slow_cooling": ["SC_T"],
+    "order06_fast_cooling_1": ["FC1_T"],
+    "order07_overaging": ["OA_T"],
+    "order08_fast_cooling_2": ["FC2_T"],
+    "order09_quenching": ["Q_T", "CT"],
+    "order10_export_looper_temper_mill": ["RF", "BF", "CRR"],
+    "order11_shear_coiler_quality": ["EL", VIRTUAL_QUALITY_NODE_NAME],
+}
+PROCESS_ORDER_NAMES = list(PROCESS_ORDER_NODE_MAP.keys())
+PROCESS_ORDER_TO_ID = {name: idx for idx, name in enumerate(PROCESS_ORDER_NAMES)}
+NUM_PROCESS_ORDERS = len(PROCESS_ORDER_NAMES)
+
+STAGE_NODE_MAP = {
+    **PROCESS_STAGE_NODE_MAP,
+    QUALITY_STAGE_NAME: [VIRTUAL_QUALITY_NODE_NAME],
+}
+STAGE_NAMES = list(STAGE_NODE_MAP.keys())
+STAGE_TO_ID = {name: idx for idx, name in enumerate(STAGE_NAMES)}
+MOE_STAGE_NAMES = list(PROCESS_STAGE_NODE_MAP.keys())
+NUM_GRAPH_STAGES = len(STAGE_NAMES)
+
+
+DATA_PATH = str(PROJECT_ROOT / "data" / "CAPL.xlsx")
+LABEL_COL = "屈服强度"
+LABEL_ALIASES = [
+    "屈服强度",
+    "YS",
+    "Yield Strength",
+    "yield_strength",
+    "yield strength",
+    "YieldStrength",
+]
+
+COLUMN_ALIASES = {
+    "FS": ["FS", "炉子速度", "炉速"],
+    "JPF_PT": ["JPF_PT", "JPF-PT", "JPF PT", "JPF（预热炉温度）", "JPF(预热炉温度)", "JPF预热炉温度"],
+    "HF_T": ["HF_T", "HF-T", "HF T", "加热炉温度"],
+    "SF_T": ["SF_T", "SF-T", "SF T", "均热炉温度"],
+    "SC_T": ["SC_T", "SC-T", "SC T", "缓冷炉温度"],
+    "FC1_T": ["FC1_T", "FC1-T", "FC1 T", "快冷炉1温度", "快冷炉一温度"],
+    "OA_T": ["OA_T", "OA-T", "OA T", "过时效炉温度"],
+    "FC2_T": ["FC2_T", "FC2-T", "FC2 T", "快冷炉2温度", "快冷炉二温度"],
+    "Q_T": ["Q_T", "Q-T", "Q T", "淬火炉温度"],
+    "EL": ["EL", "延伸率"],
+    "RF": ["RF", "轧制力"],
+    "BF": ["BF", "弯辊力"],
+    "HT": ["HT", "加热温度"],
+    "FRT": ["FRT", "终轧温度"],
+    "CT": ["CT", "卷取温度"],
+    "ATh": ["ATh", "实际厚度"],
+    "AWd": ["AWd", "实际宽度"],
+    "CRR": ["CRR", "冷轧压下率"],
+    "C": ["C", "[C]"],
+    "Mn": ["Mn", "[Mn]"],
+    "S": ["S", "[S]"],
+    "P": ["P", "[P]"],
+}
+
+
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+SPLIT_METHOD = "stratified_random"
+STRATIFY_BINS = 10
+SPLIT_SEED = 42
+STANDARDIZE_X = True
+STANDARDIZE_Y = True
+MISSING_VALUE_STRATEGY = "median"
+SYNTHETIC_NUM_SAMPLES = 256
+
+
+SEED = 42
+DEVICE = "auto"
+D_MODEL = 64
+GRAPH_EMBED_DIM = 64
+GRAPH_BACKBONE_LAYERS = 2
+DROPOUT = 0.20
+IPOHGN_LAYER_ATTENUATION = 0.60
+
+NUM_EXPERTS = 4
+TOP_K = 2
+
+MOE_AUX_LAMBDA = 0.20
+MOE_AUX_WEIGHT = MOE_AUX_LAMBDA
+MOE_GATE_TEMPERATURE = 1.0
+MOE_BALANCE_PROB_LAMBDA = 0.5
+MOE_BALANCE_USAGE_LAMBDA = 1.0
+MOE_ENTROPY_REG_LAMBDA = 0.01
+EXPERT_FOCUS_INPUT_GAIN = 0.25
+EXPERT_FOCUS_PRIOR_GAIN = 0.50
+EXPERT_FOCUS_READOUT_ALPHA = 0.35
+EXPERT_DIVERSITY_LAMBDA = 0.001
+EXPERT_CALIBRATION_LAMBDA = 0.03
+EXPERT_CALIBRATION_QUALITY_LAMBDA = 0.08
+EXPERT_CALIBRATION_QUALITY_INDEX = 3
+
+AGENT_HIDDEN_DIM = 128
+AGENT_DROPOUT = 0.20
+AGENT_USE_PROCESS_FEATURES = True
+AGENT_USE_EXPERT_PREDS = True
+AGENT_USE_UNCERTAINTY = True
+AGENT_OUTPUT_SAMPLE_CONFIDENCE = True
+AGENT_REASON_DIM = 4
+AGENT_RELIABILITY_ROUTING_LAMBDA = 1.0
+AGENT_USE_SAMPLE_WEIGHT_FOR_SUPERVISED_LOSS = False
+AGENT_CONFIDENCE_REG_LAMBDA = 0.0
+
+USE_AGENT_REWARD = True
+AGENT_REWARD_LAMBDA = 0.01
+REWARD_ALPHA_ERROR = 1.0
+REWARD_ALPHA_UNCERTAINTY = 0.5
+REWARD_ALPHA_ENTROPY = 0.1
+REWARD_ALPHA_TAIL = 0.2
+REWARD_CLAMP_MIN = -3.0
+REWARD_CLAMP_MAX = 3.0
+TARGET_CONFIDENCE_MEAN = 0.6
+CONFIDENCE_MEAN_REG_LAMBDA = 0.01
+CONFIDENCE_ENTROPY_REG_LAMBDA = 0.001
+USE_CONFIDENCE_WEIGHTED_SUPERVISED_LOSS = False
+TAIL_QUANTILE_LOW = 0.10
+TAIL_QUANTILE_HIGH = 0.90
+TAIL_THRESHOLD_MODE = "train_quantile"
+
+USE_TABDIFF_GENERATION = True
+TABDIFF_REPO_PATH = "third_party/TabDiff"
+TABDIFF_DATA_DIR = "data/tabdiff"
+TABDIFF_OUTPUT_DIR = "outputs/tabdiff"
+TABDIFF_DATANAME = "capl"
+TABDIFF_EXP_NAME = "capl_tabdiff"
+TABDIFF_NUM_SAMPLES = 5000
+TABDIFF_GENERATION_SEED = 0
+TABDIFF_TRAIN_EPOCHS = None
+TABDIFF_LOW_TAIL_RATIO = 0.5
+TABDIFF_HIGH_TAIL_RATIO = 0.5
+TABDIFF_GPU = -1
+TABDIFF_CKPT_PATH = ""
+TABDIFF_MECHANISM_CONSTRAINT = True
+TABDIFF_MECHANISM_LAMBDA = 0.05
+TABDIFF_GUIDANCE_SCALE = 0.05
+TABDIFF_MECHANISM_TEMPERATURE_HOLD_TOLERANCE = 10.0
+TABDIFF_MECHANISM_YIELD_TOLERANCE = 0.0
+TABDIFF_TRAINABLE_SCOPE = "mlp_detokenizer"
+TABDIFF_MIN_SAVE_EPOCH = 1
+TABDIFF_FINETUNE_LR = 0.0001
+TABDIFF_FINETUNE_STEPS = 500
+TABDIFF_NUM_TIMESTEPS_OVERRIDE = 50
+TABDIFF_STOCHASTIC_SAMPLER = True
+
+USE_SYNTHETIC_PRETRAIN = False
+SYNTHETIC_DATA_PATH = "data/synthetic_CAPL_ma_tabdiff.xlsx"
+SYNTHETIC_LABEL_COL = LABEL_COL
+SYNTHETIC_PRETRAIN_EPOCHS = 100
+SYNTHETIC_BATCH_SIZE = 32
+SYNTHETIC_USE_AGENT_WEIGHT = True
+SYNTHETIC_USE_REWARD_LOSS = True
+SYNTHETIC_AGENT_HIDDEN_DIM = 128
+SYNTHETIC_AGENT_ATTENTION_DIM = 64
+SYNTHETIC_AGENT_ATTENTION_HEADS = 4
+SYNTHETIC_AGENT_DROPOUT = 0.20
+SYNTHETIC_AGENT_EPOCHS = 20
+SYNTHETIC_AGENT_LR = 1.0e-3
+SYNTHETIC_CONFIDENCE_THRESHOLD = 0.50
+SYNTHETIC_PRETRAIN_CONFIDENCE_THRESHOLD = 0.00
+SYNTHETIC_SAVE_DIAGNOSTICS = True
+ALLOW_SYNTHETIC_SMOKE_FALLBACK = False
+SYNTHETIC_USE_PROCESS_CONSISTENCY = True
+SYNTHETIC_PROCESS_CONSISTENCY_THRESHOLD = 0.00
+SYNTHETIC_PROCESS_RANGE_QUANTILE_LOW = 0.01
+SYNTHETIC_PROCESS_RANGE_QUANTILE_HIGH = 0.99
+SYNTHETIC_PROCESS_RANGE_MARGIN = 0.10
+SYNTHETIC_PROCESS_KNN_K = 5
+SYNTHETIC_PROCESS_RANGE_WEIGHT = 0.35
+SYNTHETIC_PROCESS_MANIFOLD_WEIGHT = 0.35
+SYNTHETIC_PROCESS_LABEL_WEIGHT = 0.30
+SYNTHETIC_PROCESS_SCORE_POWER = 1.0
+SYNTHETIC_USE_MECHANISM_CONSISTENCY = True
+SYNTHETIC_MECHANISM_SCORE_POWER = 1.0
+SYNTHETIC_REWARD_MSE_WEIGHT = 0.50
+SYNTHETIC_REWARD_PROCESS_WEIGHT = 0.25
+SYNTHETIC_REWARD_MECHANISM_WEIGHT = 0.25
+USE_DYNAMIC_SYNTHETIC_AGENT = True
+DYNAMIC_SYNTHETIC_REFRESH_EPOCHS = 5
+DYNAMIC_SYNTHETIC_WARMUP_EPOCHS = 5
+DYNAMIC_SYNTHETIC_USE_SAMPLER = True
+DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT = True
+DYNAMIC_SYNTHETIC_TOP_RATIO = 0.60
+DYNAMIC_SYNTHETIC_WEIGHT_MIN = 0.05
+DYNAMIC_SYNTHETIC_WEIGHT_MAX = 3.00
+DYNAMIC_SYNTHETIC_EMA = 0.70
+DYNAMIC_SYNTHETIC_ERROR_WEIGHT = 0.45
+DYNAMIC_SYNTHETIC_TRAIN_REGION_WEIGHT = 0.30
+DYNAMIC_SYNTHETIC_SCARCITY_WEIGHT = 0.25
+DYNAMIC_SYNTHETIC_REAL_FEEDBACK_WEIGHT = 0.35
+DYNAMIC_SYNTHETIC_QUOTA_STRENGTH = 0.50
+DYNAMIC_SYNTHETIC_QUOTA_MIN = 0.50
+DYNAMIC_SYNTHETIC_QUOTA_MAX = 1.75
+DYNAMIC_SYNTHETIC_RELIABILITY_FLOOR = 0.20
+DYNAMIC_SYNTHETIC_SCARCITY_BINS = 10
+DYNAMIC_SYNTHETIC_PROCESS_POWER = 1.0
+DYNAMIC_SYNTHETIC_MECHANISM_POWER = 1.0
+DYNAMIC_SYNTHETIC_TRAIN_REWARD_METRIC = "rmse_tail"
+DYNAMIC_SYNTHETIC_TRAIN_TAIL_LAMBDA = 0.25
+USE_EL_AS_INPUT = False
+USE_LAPLACE = False
+EXPERIMENT_NAME = "default"
+
+SMALL_BATCH_OVERFIT_SIZE = 32
+SMALL_BATCH_OVERFIT_EPOCHS = 300
+SMALL_BATCH_OVERFIT_SUCCESS_RMSE = 5.0
+
+
+BATCH_SIZE = 32
+EPOCHS = 50
+LR = 1.0e-3
+WEIGHT_DECAY = 1.0e-3
+USE_LAYERWISE_FINETUNE_LR = True
+FINETUNE_BACKBONE_LR = 1.0e-4
+FINETUNE_HEAD_LR = 5.0e-4
+FINETUNE_AGENT_LR = 1.0e-3
+FINETUNE_QUALITY_AGENT_LR = 1.0e-3
+FREEZE_FINETUNE_BACKBONE = True
+FINETUNE_TRAINABLE_KEYWORDS = [
+    "readout",
+    "mu_head",
+    "log_b_head",
+    "gate.",
+    "gate_state_proj",
+    "router",
+]
+USE_MR_LORA = True
+MR_LORA_SCOPE = "graph_attention_routing"
+MR_LORA_RANK_GRAPH = 8
+MR_LORA_RANK_ROUTING = 4
+MR_LORA_ALPHA_GRAPH = 16.0
+MR_LORA_ALPHA_ROUTING = 8.0
+MR_LORA_DROPOUT = 0.05
+MR_LORA_TRAIN_OUTPUT_HEAD = False
+GRAD_CLIP_NORM = 2.0
+
+USE_CLUSTER_BALANCE_REWARD = True
+NUM_WORKING_CONDITION_CLUSTERS = 5
+CLUSTER_BALANCE_LAMBDA = 0.3
+REWARD_ALPHA_CLUSTER = 0.3
+CLUSTER_BALANCE_MAE_WEIGHT = 0.3
+CLUSTER_BALANCE_MAPE_WEIGHT = 0.1
+CLUSTER_BALANCE_R2_WEIGHT = 0.3
+CLUSTER_BALANCE_R2_MIN = -1.0
+CLUSTER_BALANCE_R2_MAX = 1.0
+CLUSTER_BALANCE_PENALTY_MIN = -1.0
+CLUSTER_BALANCE_PENALTY_MAX = 0.0
+
+NUM_WORKERS = 0
+EARLY_STOPPING_PATIENCE = 5
+EARLY_STOPPING_MIN_DELTA = 0.0
+CHECKPOINT_SELECTION_METRIC = "rmse_tail"
+CHECKPOINT_TAIL_MAE_LAMBDA = 0.10
+
+LAMBDA_MOE = MOE_AUX_LAMBDA
+LAMBDA_GRAPH = 0.001
+LAPLACE_EPS = 1.0e-6
+TAIL_QUANTILE = 0.10
+
+
+def active_node_names(use_el_as_input: bool | None = None) -> list[str]:
+    """Return graph nodes after applying EL and virtual quality switches."""
+    if use_el_as_input is None:
+        use_el_as_input = USE_EL_AS_INPUT
+    if use_el_as_input:
+        return list(NODE_NAMES)
+    nodes = [name for name in NODE_NAMES if name != "EL"]
+    if USE_VIRTUAL_QUALITY_NODE:
+        nodes.append(VIRTUAL_QUALITY_NODE_NAME)
+    return nodes
+
+
+def input_node_names(use_el_as_input: bool | None = None) -> list[str]:
+    """Return real CAPL input variables only, excluding virtual nodes."""
+    if use_el_as_input is None:
+        use_el_as_input = USE_EL_AS_INPUT
+    if use_el_as_input:
+        return list(NODE_NAMES)
+    return [name for name in NODE_NAMES if name != "EL"]

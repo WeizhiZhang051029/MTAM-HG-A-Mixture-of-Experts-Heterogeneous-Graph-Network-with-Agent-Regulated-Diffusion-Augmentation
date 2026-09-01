@@ -1,0 +1,3 @@
+# Preserve the vendored upstream source exactly; its historical whitespace is
+# outside MTAM-HG's formatting contract.
+third_party/TabDiff/** whitespace=-trailing-space,-blank-at-eof
