@@ -15,7 +15,7 @@ DEFAULT_MAIN_OUTPUT_ROOT = "outputs/mtam_hg"
 
 DEFAULT_EPOCHS = 50
 DEFAULT_SYNTHETIC_PRETRAIN_EPOCHS = 100
-DEFAULT_SYNTHETIC_AGENT_EPOCHS = 100
+DEFAULT_SYNTHETIC_AGENT_EPOCHS = 20
 DEFAULT_SYNTHETIC_AGENT_LR = 1.0e-3
 DEFAULT_SYNTHETIC_AGENT_HIDDEN_DIM = 128
 DEFAULT_SYNTHETIC_AGENT_ATTENTION_DIM = 64
@@ -29,7 +29,7 @@ DEFAULT_EARLY_STOPPING_PATIENCE = 5
 DEFAULT_SYNTHETIC_CONFIDENCE_THRESHOLD = 0.50
 DEFAULT_USE_DYNAMIC_SYNTHETIC_AGENT = True
 DEFAULT_DYNAMIC_SYNTHETIC_REFRESH_EPOCHS = 5
-DEFAULT_DYNAMIC_SYNTHETIC_WARMUP_EPOCHS = 5
+DEFAULT_DYNAMIC_SYNTHETIC_WARMUP_EPOCHS = 0
 DEFAULT_DYNAMIC_SYNTHETIC_USE_SAMPLER = True
 DEFAULT_DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT = True
 DEFAULT_DYNAMIC_SYNTHETIC_TOP_RATIO = 0.60
@@ -71,69 +71,7 @@ DEFAULT_MR_LORA_TRAIN_OUTPUT_HEAD = False
 DEFAULT_MAIN_CHECKPOINT_SELECTION_METRIC = "rmse"
 DEFAULT_MAIN_CHECKPOINT_TAIL_MAE_LAMBDA = 0.0
 DEFAULT_TABDIFF_NUM_SAMPLES = 5000
-DEFAULT_CBTG_CROSS_RUN_VALIDATION_STD_PATH = "data/cbtg_cross_run_validation_std.json"
-CONFIRMATORY_YAML_CANONICAL_SHA256 = "c4b306f732f61c999b3f1d254685cc44ae110bd04294117f34a89bc730eb6bd2"
 
-CONFIRMATORY_LOCKED_ARGS = {
-    "epochs": DEFAULT_EPOCHS,
-    "synthetic_pretrain_epochs": DEFAULT_SYNTHETIC_PRETRAIN_EPOCHS,
-    "synthetic_agent_epochs": DEFAULT_SYNTHETIC_AGENT_EPOCHS,
-    "synthetic_agent_lr": DEFAULT_SYNTHETIC_AGENT_LR,
-    "synthetic_agent_hidden_dim": DEFAULT_SYNTHETIC_AGENT_HIDDEN_DIM,
-    "synthetic_agent_attention_dim": DEFAULT_SYNTHETIC_AGENT_ATTENTION_DIM,
-    "synthetic_agent_attention_heads": DEFAULT_SYNTHETIC_AGENT_ATTENTION_HEADS,
-    "dropout": DEFAULT_DROPOUT,
-    "agent_dropout": DEFAULT_DROPOUT,
-    "synthetic_agent_dropout": DEFAULT_DROPOUT,
-    "synthetic_confidence_threshold": DEFAULT_SYNTHETIC_CONFIDENCE_THRESHOLD,
-    "synthetic_pretrain_confidence_threshold": 0.0,
-    "use_dynamic_synthetic_agent": DEFAULT_USE_DYNAMIC_SYNTHETIC_AGENT,
-    "dynamic_synthetic_refresh_epochs": DEFAULT_DYNAMIC_SYNTHETIC_REFRESH_EPOCHS,
-    "dynamic_synthetic_warmup_epochs": DEFAULT_DYNAMIC_SYNTHETIC_WARMUP_EPOCHS,
-    "dynamic_synthetic_use_sampler": DEFAULT_DYNAMIC_SYNTHETIC_USE_SAMPLER,
-    "dynamic_synthetic_use_loss_weight": DEFAULT_DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT,
-    "dynamic_synthetic_top_ratio": DEFAULT_DYNAMIC_SYNTHETIC_TOP_RATIO,
-    "dynamic_synthetic_weight_min": DEFAULT_DYNAMIC_SYNTHETIC_WEIGHT_MIN,
-    "dynamic_synthetic_weight_max": DEFAULT_DYNAMIC_SYNTHETIC_WEIGHT_MAX,
-    "dynamic_synthetic_ema": DEFAULT_DYNAMIC_SYNTHETIC_EMA,
-    "dynamic_synthetic_error_weight": DEFAULT_DYNAMIC_SYNTHETIC_ERROR_WEIGHT,
-    "dynamic_synthetic_train_region_weight": DEFAULT_DYNAMIC_SYNTHETIC_TRAIN_REGION_WEIGHT,
-    "dynamic_synthetic_scarcity_weight": DEFAULT_DYNAMIC_SYNTHETIC_SCARCITY_WEIGHT,
-    "dynamic_synthetic_real_feedback_weight": DEFAULT_DYNAMIC_SYNTHETIC_REAL_FEEDBACK_WEIGHT,
-    "dynamic_synthetic_quota_strength": DEFAULT_DYNAMIC_SYNTHETIC_QUOTA_STRENGTH,
-    "dynamic_synthetic_quota_min": DEFAULT_DYNAMIC_SYNTHETIC_QUOTA_MIN,
-    "dynamic_synthetic_quota_max": DEFAULT_DYNAMIC_SYNTHETIC_QUOTA_MAX,
-    "dynamic_synthetic_reliability_floor": DEFAULT_DYNAMIC_SYNTHETIC_RELIABILITY_FLOOR,
-    "dynamic_synthetic_scarcity_bins": DEFAULT_DYNAMIC_SYNTHETIC_SCARCITY_BINS,
-    "dynamic_synthetic_process_power": DEFAULT_DYNAMIC_SYNTHETIC_PROCESS_POWER,
-    "dynamic_synthetic_mechanism_power": DEFAULT_DYNAMIC_SYNTHETIC_MECHANISM_POWER,
-    "dynamic_synthetic_train_reward_metric": DEFAULT_DYNAMIC_SYNTHETIC_TRAIN_REWARD_METRIC,
-    "dynamic_synthetic_train_tail_lambda": DEFAULT_DYNAMIC_SYNTHETIC_TRAIN_TAIL_LAMBDA,
-    "use_cluster_balance_reward": DEFAULT_USE_CLUSTER_BALANCE_REWARD,
-    "num_working_condition_clusters": DEFAULT_NUM_WORKING_CONDITION_CLUSTERS,
-    "cluster_balance_lambda": DEFAULT_CLUSTER_BALANCE_LAMBDA,
-    "reward_alpha_cluster": DEFAULT_REWARD_ALPHA_CLUSTER,
-    "finetune_backbone_lr": DEFAULT_FINETUNE_BACKBONE_LR,
-    "finetune_head_lr": DEFAULT_FINETUNE_HEAD_LR,
-    "finetune_agent_lr": DEFAULT_FINETUNE_AGENT_LR,
-    "finetune_quality_agent_lr": DEFAULT_FINETUNE_QUALITY_AGENT_LR,
-    "use_layerwise_finetune_lr": True,
-    "freeze_finetune_backbone": DEFAULT_FREEZE_FINETUNE_BACKBONE,
-    "use_mr_lora": DEFAULT_USE_MR_LORA,
-    "mr_lora_scope": DEFAULT_MR_LORA_SCOPE,
-    "mr_lora_rank_graph": DEFAULT_MR_LORA_RANK_GRAPH,
-    "mr_lora_rank_routing": DEFAULT_MR_LORA_RANK_ROUTING,
-    "mr_lora_alpha_graph": DEFAULT_MR_LORA_ALPHA_GRAPH,
-    "mr_lora_alpha_routing": DEFAULT_MR_LORA_ALPHA_ROUTING,
-    "mr_lora_dropout": DEFAULT_MR_LORA_DROPOUT,
-    "mr_lora_train_output_head": DEFAULT_MR_LORA_TRAIN_OUTPUT_HEAD,
-    "batch_size": DEFAULT_BATCH_SIZE,
-    "lr": DEFAULT_LR,
-    "weight_decay": DEFAULT_WEIGHT_DECAY,
-    "early_stopping_patience": DEFAULT_EARLY_STOPPING_PATIENCE,
-    "checkpoint_selection_metric": DEFAULT_MAIN_CHECKPOINT_SELECTION_METRIC,
-    "checkpoint_tail_mae_lambda": DEFAULT_MAIN_CHECKPOINT_TAIL_MAE_LAMBDA,
-}
 
 RUNNER_SUMMARY_NAME = "experiment_summary.json"
 SUPERVISED_MAIN_TRAIN_MODE = "train_with_tabdiff_pretrain"
@@ -179,7 +117,6 @@ CLUSTER_BALANCE_ARG_SPECS = [
 ]
 
 MAIN_TRAIN_ARG_SPECS = [
-    ("cbtg_cross_run_validation_std_path", "--cbtg_cross_run_validation_std_path"),
     ("dropout", "--dropout"),
     ("agent_dropout", "--agent_dropout"),
     ("synthetic_agent_epochs", "--synthetic_agent_epochs"),

@@ -105,7 +105,6 @@ def main(args):
         info = json.load(f)
     
     ## Set up flags
-    is_dcr = 'dcr' in dataname
 
     ## Set experiment name
     exp_name = args.exp_name
@@ -147,10 +146,7 @@ def main(args):
         model_save_path = 'debug/ckpt' if args.debug else f'{curr_dir}/ckpt/{dataname}/{exp_name}'
         result_save_path = model_save_path.replace('ckpt', 'result')  #i.e., f'{curr_dir}/results/{dataname}/{exp_name}'
     elif args.mode == 'test':
-        if args.report:
-            result_save_path = f"eval/report_runs/{exp_name}/{dataname}"
-        else:
-            result_save_path = os.path.dirname(ckpt_path).replace('ckpt', 'result')    # infer the exp_name from the ckpt_name
+        result_save_path = os.path.dirname(ckpt_path).replace('ckpt', 'result')
     raw_config['model_save_path'] = model_save_path
     raw_config['result_save_path'] = result_save_path
     if model_save_path is not None:
@@ -207,17 +203,7 @@ def main(args):
     if not os.path.exists(val_data_path):
         print(f"{args.dataname} does not have its validation set. During MLE evaluation, a validation set will be splitted from the training set!")
         val_data_path = None
-    if args.mode == 'train':
-        metric_list = ["density"]
-    else:
-        if is_dcr:
-            metric_list = ["dcr"]
-        else:
-            metric_list = [
-                "density", 
-                "mle", 
-                "c2st",
-            ]
+    metric_list = []
     metrics = TabMetrics(real_data_path, test_data_path, val_data_path, info, device, metric_list=metric_list)
     
     ## Load the module and models
@@ -257,26 +243,7 @@ def main(args):
         validate_trainable_scope(args.trainable_scope, ckpt_path)
     apply_trainable_scope(model, args.trainable_scope)
     
-    ## Create and load y_only_model for imputation
     y_only_model = None
-    if args.impute:
-        y_only_model_path = args.y_only_model_path
-        if y_only_model_path is None:
-            y_only_model_parent_path = f"{curr_dir}/ckpt/{dataname}/{exp_name}_y_only"
-            y_only_model_path_arr = glob.glob(f"{y_only_model_parent_path}/best_ema_model*")
-            assert y_only_model_path_arr, f"Cannot not infer y_only model's ckpt_path from {y_only_model_parent_path}, please make sure that you first train a y_only model before testing imputation!"
-            y_only_model_path = y_only_model_path_arr[0]
-        y_only_model_config_path = os.path.join(os.path.dirname(y_only_model_path), 'config.pkl')
-        with open(y_only_model_config_path, 'rb') as f:
-                y_only_model_config = pickle.load(f)
-        y_only_model = UniModMLP(
-            **y_only_model_config['unimodmlp_params']
-        )
-        y_only_model = Model(y_only_model, **y_only_model_config['diffusion_params']['edm_params'])
-        y_only_model.to(device)
-        # load weights
-        state_dicts = torch.load(y_only_model_path, map_location=device)
-        y_only_model.load_state_dict(state_dicts['denoise_fn'])
 
     if not args.y_only and not args.non_learnable_schedule:
         raw_config['diffusion_params']['scheduler'] = 'power_mean_per_column'
@@ -349,23 +316,7 @@ def main(args):
         reset_train_epoch=args.reset_train_epoch,
     )
     if args.mode == 'test':
-        if args.report:
-            if  is_dcr:
-                trainer.report_test_dcr(args.num_runs)
-            else:
-                trainer.report_test(args.num_runs)
-        elif args.impute:
-            imputed_sample_save_dir = f"impute/{dataname}/{exp_name}"
-            trainer.test_impute(
-                args.trial_start, args.trial_size, 
-                args.resample_rounds, 
-                args.impute_condition, 
-                imputed_sample_save_dir,
-                args.w_num,
-                args.w_cat,
-            )
-        else:
-            trainer.test()
+        trainer.test()
     else:
         ## Save config
         config_save_path = raw_config['model_save_path']

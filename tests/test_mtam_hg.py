@@ -618,12 +618,12 @@ class MTAMHGTest(unittest.TestCase):
         self.assertAlmostEqual(float(parts["selection_score"][2]), 0.95 * 1.0 * 0.05 * 2.0)
 
     def test_agent_feedback_contains_four_states_for_each_paper_metric(self) -> None:
-        overall = np.array([6.0, 4.0, 3.0, 0.1, 3.5], dtype=np.float64)
-        run_std = np.array([0.2, 0.1, 0.15, 0.01, 0.4], dtype=np.float64)
+        overall = np.array([6.0, 4.0, 3.0, 0.1], dtype=np.float64)
+        run_std = np.array([0.2, 0.1, 0.15, 0.01], dtype=np.float64)
         per_cluster = np.array(
             [
-                [5.0, 3.0, 2.0, 0.08, 2.5],
-                [8.0, 6.0, 4.5, 0.20, 6.0],
+                [5.0, 3.0, 2.0, 0.08],
+                [8.0, 6.0, 4.5, 0.20],
             ],
             dtype=np.float64,
         )
@@ -635,9 +635,9 @@ class MTAMHGTest(unittest.TestCase):
             np.array([0, 0, 1, 1], dtype=np.int64),
         )
 
-        self.assertEqual(len(AGENT_FEEDBACK_FEATURE_NAMES), 20)
-        self.assertEqual(parts["features"].shape, (4, 20))
-        self.assertEqual(parts["raw_state"].shape, (4, 5, 4))
+        self.assertEqual(len(AGENT_FEEDBACK_FEATURE_NAMES), 16)
+        self.assertEqual(parts["features"].shape, (4, 16))
+        self.assertEqual(parts["raw_state"].shape, (4, 4, 4))
         self.assertTrue(np.all(parts["target"] >= -1.0))
         self.assertTrue(np.all(parts["target"] <= 1.0))
 

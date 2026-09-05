@@ -280,3 +280,55 @@ def test_finetune_checkpoint_initializes_model_and_ema_weights(
         for loaded_parameter, ema_parameter in zip(loaded.parameters(), ema.parameters()):
             assert torch.all(loaded_parameter == 3.0)
             assert torch.equal(loaded_parameter, ema_parameter)
+
+    from types import SimpleNamespace
+
+    (tmp_path / "ckpt").mkdir()
+    trainer.steps = 3
+    trainer.train_iter = [torch.ones(2, 2) for _ in range(4)]
+    trainer.dataset = SimpleNamespace(d_numerical=0, categories=[])
+    trainer.logger = SimpleNamespace(define_metric=lambda *a, **kw: None, log=lambda *a, **kw: None)
+    trainer.lr_scheduler = "fixed"
+    calls = []
+    def step(*args):
+        calls.append(1)
+        return torch.tensor(0.0), torch.tensor(1.0)
+    monkeypatch.setattr(trainer, "_run_step", step)
+    monkeypatch.setattr(trainer, "compute_loss", lambda: (0.0, 1.0))
+    trainer.run_loop()
+    assert len(calls) == trainer.optimizer_steps == 3
+
+
+def test_sampling_guidance_is_independent_of_batch_size() -> None:
+    from types import SimpleNamespace
+
+    from tabdiff.models.unified_ctime_diffusion import UnifiedCtimeDiffusion
+
+    def constraint(x, reduce=False):
+        return x.square().sum(dim=1)
+    diffusion = SimpleNamespace(
+        num_numerical_features=3,
+        mechanism_constraint=constraint,
+        guidance_scale=0.05,
+        num_timesteps=50,
+    )
+    sample = torch.tensor([[1.0, 2.0, 3.0]])
+    one = UnifiedCtimeDiffusion.apply_mechanism_guidance(diffusion, sample, 49)
+    batch = UnifiedCtimeDiffusion.apply_mechanism_guidance(diffusion, sample.repeat(8, 1), 49)
+    torch.testing.assert_close(one, sample * 0.9)
+    torch.testing.assert_close(batch, one.repeat(8, 1))
+
+
+def test_sampling_does_not_generate_unused_rows() -> None:
+    from types import SimpleNamespace
+
+    from tabdiff.models.unified_ctime_diffusion import UnifiedCtimeDiffusion
+
+    calls = []
+    def sample(n):
+        calls.append(n)
+        return torch.ones(n, 3)
+    diffusion = SimpleNamespace(sample=sample)
+    result = UnifiedCtimeDiffusion.sample_all(diffusion, 10, 6)
+    assert calls == [6, 4]
+    assert result.shape == (10, 3)

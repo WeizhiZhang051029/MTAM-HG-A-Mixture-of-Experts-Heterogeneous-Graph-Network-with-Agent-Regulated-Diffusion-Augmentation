@@ -35,7 +35,7 @@ class CAPLMechanismConstraint(nn.Module):
         quantile_references: np.ndarray,
         low_quantile: float = 0.01,
         high_quantile: float = 0.99,
-        margin: float = 0.10,
+        margin: float = 0.0,
         ridge_alpha: float = 1.0e-3,
         temperature_hold_tolerance: float = 10.0,
         yield_tolerance: float = 0.0,
@@ -243,7 +243,7 @@ class CAPLMechanismConstraint(nn.Module):
                 f"Missing the paper-required {role} temperature column; tried {list(aliases)}."
             )
 
-        heat = resolve("preheating-furnace", ("JPF_PT", "JPF-PT", "JPF PT", "JPF预热炉温度"))
+        heat = resolve("preheating-furnace", ("JPF_PT", "JPF-PT", "JPF PT", "JPF预热炉温度", "JPF（预热炉温度）", "JPF(预热炉温度)"))
         soak_start = resolve("heating-furnace", ("HF_T", "HF-T", "HF T", "加热炉温度"))
         soak_end = resolve("soaking-furnace", ("SF_T", "SF-T", "SF T", "均热炉温度"))
         cool = resolve("slow-cooling-furnace", ("SC_T", "SC-T", "SC T", "缓冷炉温度"))

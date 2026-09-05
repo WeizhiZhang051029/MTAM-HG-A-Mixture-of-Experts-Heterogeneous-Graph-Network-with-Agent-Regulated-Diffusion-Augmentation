@@ -236,6 +236,12 @@ def save_evaluation_outputs(
         np.save(output_dir / "learned_A_kg.npy", collected["A_kg"])
     if "A_kg_experts" in collected:
         np.save(output_dir / "learned_A_kg_experts.npy", collected["A_kg_experts"])
+        edge_importance = np.abs(collected["A_kg_experts"]).mean(axis=0)
+        np.fill_diagonal(edge_importance, 0.0)
+        node_scores = edge_importance.sum(axis=0) + edge_importance.sum(axis=1)
+        node_importance = node_scores / max(float(node_scores.max()), 1.0e-12)
+        np.save(output_dir / "edge_importance.npy", edge_importance)
+        np.save(output_dir / "node_importance.npy", node_importance)
     if "A_het" in collected:
         np.save(output_dir / "learned_A_het.npy", collected["A_het"])
     if "gate_weights" in collected:

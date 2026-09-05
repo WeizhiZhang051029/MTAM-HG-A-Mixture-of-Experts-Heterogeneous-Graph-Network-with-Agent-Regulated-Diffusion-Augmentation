@@ -236,7 +236,7 @@ class MTAMHG(nn.Module):
                     d_model=d_model,
                     num_layers=num_layers,
                     use_laplace=use_laplace,
-                    enable_relation_scaling=True,
+                    enable_relation_scaling=False,
                     expert_name=name,
                     mechanism_focus_nodes=MECHANISM_EXPERT_NODE_GROUPS.get(name, config.input_node_names(config.USE_EL_AS_INPUT)),
                 )

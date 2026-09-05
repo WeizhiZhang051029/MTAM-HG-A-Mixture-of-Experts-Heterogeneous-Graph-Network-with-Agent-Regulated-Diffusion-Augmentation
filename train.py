@@ -13,7 +13,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 import config
-from evaluate import evaluate_model, save_evaluation_outputs
+from evaluate import evaluate_model
 from losses import (
     prediction_loss,
     total_loss,
@@ -21,8 +21,7 @@ from losses import (
 from models.mr_lora import inject_mr_lora, mr_lora_parameter_names, mr_lora_scope_families
 from models.mtam_hg import MTAMHG
 from training.clusters import WorkingConditionCluster
-from utils.logger import append_csv, ensure_dirs, save_json
-from utils.seed import set_seed
+from utils.logger import append_csv, save_json
 
 
 def resolve_device() -> torch.device:
@@ -563,58 +562,8 @@ def supervised_finetune(
     return best_score, best_epoch, epochs_run, stopped_early
 
 
-def run_training(data_bundle, mode: str = "train", epochs: int | None = None) -> tuple[torch.nn.Module, dict[str, float]]:
-    ensure_dirs(config.CHECKPOINT_DIR, config.LOG_DIR, config.RESULT_DIR)
-    set_seed(config.SEED)
-    device = resolve_device()
-    model = build_experiment_model().to(device)
-    start_time = time.perf_counter()
-
-    best_epoch = -1
-    _, best_epoch, epochs_run, stopped_early = supervised_finetune(
-        model,
-        data_bundle,
-        device,
-        epochs=epochs,
-        freeze_backbone=False,
-    )
-    ckpt_path = config.CHECKPOINT_DIR / "best_model.pth"
-    if ckpt_path.exists():
-        load_checkpoint(model, ckpt_path, device)
-
-    inference_start = time.perf_counter()
-    metrics, collected = evaluate_model(model, data_bundle.test_loader, device, data_bundle)
-    inference_time = time.perf_counter() - inference_start
-    train_time = time.perf_counter() - start_time
-    param_breakdown = moe_parameter_breakdown(model)
-    active_model = _active_model_name()
-    metrics.update(
-        {
-            "total_params": int(param_breakdown["Params"]),
-            **param_breakdown,
-            "Finetune_Freeze_Backbone": False,
-            "Train_Time": train_time,
-            "Inference_Time": inference_time,
-            "Inference_Time_Per_Sample": inference_time / max(int(data_bundle.split_sizes.get("test", 0)), 1),
-            "Best_Epoch": best_epoch,
-            "Epochs_Run": epochs_run,
-            "Stopped_Early": bool(stopped_early),
-            "Checkpoint_Selection_Metric": str(getattr(config, "CHECKPOINT_SELECTION_METRIC", "rmse")),
-            "Checkpoint_Tail_MAE_Lambda": float(getattr(config, "CHECKPOINT_TAIL_MAE_LAMBDA", 0.0) or 0.0),
-            "Model": active_model,
-            "Experiment_Group": getattr(config, "EXPERIMENT_NAME", "default"),
-            "Data_Split": data_bundle.split_method,
-            "Train_Size": int(data_bundle.split_sizes.get("train", 0)),
-            "Seed": int(config.SEED),
-            "MoE_Aux_Lambda": float(getattr(config, "MOE_AUX_LAMBDA", getattr(config, "LAMBDA_MOE", 0.01))),
-        }
-    )
-    save_evaluation_outputs(metrics, collected, config.RESULT_DIR)
-    return model, metrics
-
-
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: str | Path, device: torch.device) -> None:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state = checkpoint.get("model_state_dict", checkpoint)
     has_lora_state = any(".lora_" in name for name in state)
     has_lora_model = bool(mr_lora_parameter_names(model))
@@ -622,78 +571,3 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str | Path, device:
         maybe_enable_mr_lora(model, device=device)
     model.load_state_dict(state)
     model.to(device)
-
-
-def _inverse_y_for_bundle(y: np.ndarray, data_bundle) -> np.ndarray:
-    if config.STANDARDIZE_Y:
-        return data_bundle.y_scaler.inverse_transform(y)
-    return y
-
-
-def run_small_batch_overfit(data_bundle, epochs: int | None = None) -> dict[str, float | bool | str]:
-    """Overfit a fixed 32-sample training subset for model sanity checks."""
-    ensure_dirs(config.CHECKPOINT_DIR, config.LOG_DIR, config.RESULT_DIR)
-    set_seed(config.SEED)
-    device = resolve_device()
-    model = build_experiment_model().to(device)
-    optimizer = AdamW(model.parameters(), lr=config.LR, weight_decay=0.0)
-
-    epochs = epochs or config.SMALL_BATCH_OVERFIT_EPOCHS
-    n = min(config.SMALL_BATCH_OVERFIT_SIZE, len(data_bundle.train_loader.dataset))
-    x = data_bundle.train_loader.dataset.x[:n].to(device)
-    y = data_bundle.train_loader.dataset.y[:n].to(device)
-    log_path = config.LOG_DIR / "small_batch_overfit_rmse.csv"
-    if log_path.exists():
-        log_path.unlink()
-
-    initial_rmse = None
-    final_rmse = None
-    model.train()
-    for epoch in range(1, epochs + 1):
-        outputs = model(x)
-        loss, logs = total_loss(outputs, y, x=x)
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_NORM)
-        optimizer.step()
-
-        with torch.no_grad():
-            mu = _output_mu(outputs).detach().cpu().numpy()
-            target = y.detach().cpu().numpy()
-            mu_real = _inverse_y_for_bundle(mu, data_bundle)
-            target_real = _inverse_y_for_bundle(target, data_bundle)
-            rmse = float(np.sqrt(np.mean((mu_real - target_real) ** 2)))
-        if initial_rmse is None:
-            initial_rmse = rmse
-        final_rmse = rmse
-        append_csv(
-            log_path,
-            {
-                "epoch": epoch,
-                "train_rmse": rmse,
-                "loss": logs["total_loss"],
-                "pred_loss": logs["pred_loss"],
-                "moe_loss": logs["moe_loss"],
-            },
-        )
-
-    assert initial_rmse is not None and final_rmse is not None
-    success = final_rmse <= config.SMALL_BATCH_OVERFIT_SUCCESS_RMSE or final_rmse <= 0.5 * initial_rmse
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "initial_rmse": initial_rmse,
-            "final_rmse": final_rmse,
-            "success": success,
-        },
-        config.CHECKPOINT_DIR / "small_batch_overfit_model.pth",
-    )
-    return {
-        "samples": n,
-        "epochs": epochs,
-        "initial_rmse": initial_rmse,
-        "final_rmse": final_rmse,
-        "success": success,
-        "rmse_curve": str(log_path),
-    }

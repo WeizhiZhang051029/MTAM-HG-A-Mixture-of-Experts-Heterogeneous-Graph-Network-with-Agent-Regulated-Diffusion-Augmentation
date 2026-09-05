@@ -89,6 +89,13 @@ class PaperContractTest(unittest.TestCase):
         config_path = PROJECT_ROOT / "configs" / "mtam_hg.yaml"
         cls.paper_yaml = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
+    def test_main_experts_do_not_rescale_relation_masks(self) -> None:
+        from train import build_experiment_model
+
+        model = build_experiment_model()
+        for expert in model.experts:
+            self.assertIsNone(expert.relation_scaling)
+
     def test_exact_21_input_schema_is_shared_by_model_and_tabdiff(self) -> None:
         self.assertEqual(tuple(config.active_node_names()), EXPECTED_INPUTS)
         self.assertEqual(tuple(PAPER_FEATURE_KEYS), EXPECTED_INPUTS)
@@ -101,7 +108,7 @@ class PaperContractTest(unittest.TestCase):
         self.assertEqual(DEFAULT_SPLIT_METHOD, "stratified_random")
         self.assertEqual(config.SPLIT_METHOD, "stratified_random")
         self.assertEqual(config.SPLIT_SEED, DEFAULT_SPLIT_SEED)
-        self.assertEqual(self.paper_yaml["split_seed"], DEFAULT_SPLIT_SEED)
+        self.assertNotIn("split_seed", self.paper_yaml)
         self.assertEqual(self.paper_yaml["split_method"], DEFAULT_SPLIT_METHOD)
         self.assertEqual(self.paper_yaml["generation_seed"], DEFAULT_GENERATION_SEED)
         self.assertEqual(self.paper_yaml["model_seeds"], DEFAULT_SEEDS)
@@ -156,9 +163,9 @@ class PaperContractTest(unittest.TestCase):
     def test_cbtg_agent_state_reward_and_selection_match_the_paper(self) -> None:
         self.assertEqual(
             PAPER_CBTG_METRIC_NAMES,
-            ("RMSE", "MAE", "MAPE", "ONE_MINUS_R2", "TAIL_MAE"),
+            ("RMSE", "MAE", "MAPE", "ONE_MINUS_R2"),
         )
-        np.testing.assert_allclose(PAPER_CBTG_METRIC_WEIGHTS, (1.0, 0.3, 0.1, 0.3, 0.2))
+        np.testing.assert_allclose(PAPER_CBTG_METRIC_WEIGHTS, (1.0, 0.3, 0.1, 0.3))
         self.assertEqual(
             PAPER_CBTG_STATE_COMPONENTS,
             ("overall_mean", "run_std", "cluster_value", "cluster_variance"),
@@ -173,7 +180,7 @@ class PaperContractTest(unittest.TestCase):
         self.assertTrue(config.DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT)
         self.assertEqual(config.DYNAMIC_SYNTHETIC_PROCESS_POWER, 1.0)
         self.assertEqual(config.DYNAMIC_SYNTHETIC_MECHANISM_POWER, 1.0)
-        self.assertEqual(config.SYNTHETIC_AGENT_EPOCHS, 100)
+        self.assertEqual(config.SYNTHETIC_AGENT_EPOCHS, 20)
         self.assertEqual(config.SYNTHETIC_AGENT_LR, 1.0e-3)
 
     def test_moe_ipohgn_hsg_and_mr_lora_hyperparameters_match_the_paper(self) -> None:
@@ -200,7 +207,7 @@ class PaperContractTest(unittest.TestCase):
         self.assertEqual(DEFAULT_FINETUNE_BACKBONE_LR, 1.0e-4)
         self.assertEqual(DEFAULT_FINETUNE_HEAD_LR, 5.0e-4)
         self.assertEqual(DEFAULT_FINETUNE_AGENT_LR, 1.0e-3)
-        self.assertEqual(PAPER_METRICS, ("RMSE", "MAE", "MAPE", "R2", "TAIL_MAE"))
+        self.assertEqual(PAPER_METRICS, ("RMSE", "MAE", "MAPE", "R2"))
         self.assertEqual(DEFAULT_SEEDS, list(range(42, 52)))
         self.assertEqual(len(DEFAULT_SEEDS), 10)
 
@@ -209,7 +216,7 @@ class PaperContractTest(unittest.TestCase):
         self.assertEqual(defaults.epochs, 50)
         self.assertEqual(defaults.mr_lora_scope, "graph_attention_routing")
         self.assertEqual(defaults.seeds, DEFAULT_SEEDS)
-        self.assertEqual(defaults.split_seed, DEFAULT_SPLIT_SEED)
+        self.assertEqual(defaults.synthetic_agent_epochs, 20)
         self.assertEqual(defaults.split_method, DEFAULT_SPLIT_METHOD)
         self.assertEqual(defaults.generation_seed, DEFAULT_GENERATION_SEED)
 

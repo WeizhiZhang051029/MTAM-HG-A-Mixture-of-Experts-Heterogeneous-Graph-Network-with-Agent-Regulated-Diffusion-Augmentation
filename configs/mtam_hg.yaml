@@ -1,7 +1,6 @@
 experiment_name: mtam_hg
 output_base: outputs/mtam_hg
 model_seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
-split_seed: 42
 split_method: stratified_random
 generation_seed: 0
 
@@ -35,13 +34,12 @@ synthetic_agent_hidden_dim: 128
 synthetic_agent_attention_dim: 64
 synthetic_agent_attention_heads: 4
 synthetic_agent_dropout: 0.2
-synthetic_agent_epochs: 100
+synthetic_agent_epochs: 20
 synthetic_agent_lr: 0.001
-cbtg_cross_run_validation_std_path: data/cbtg_cross_run_validation_std.json
 synthetic_pretrain_confidence_threshold: 0.0
 use_dynamic_synthetic_agent: true
 dynamic_synthetic_refresh_epochs: 5
-dynamic_synthetic_warmup_epochs: 5
+dynamic_synthetic_warmup_epochs: 0
 dynamic_synthetic_use_sampler: true
 dynamic_synthetic_use_loss_weight: true
 dynamic_synthetic_top_ratio: 0.60

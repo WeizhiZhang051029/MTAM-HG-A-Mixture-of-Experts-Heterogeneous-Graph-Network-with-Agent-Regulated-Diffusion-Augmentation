@@ -248,7 +248,7 @@ class UnifiedCtimeDiffusion(torch.nn.Module):
             return x_num
         with torch.enable_grad():
             guided = x_num.detach().clone().requires_grad_(True)
-            energy = self.mechanism_constraint(guided, reduce=True)
+            energy = self.mechanism_constraint(guided, reduce=False).sum()
             grad = torch.autograd.grad(energy, guided, retain_graph=False, create_graph=False)[0]
             if not torch.isfinite(grad).all():
                 return x_num
@@ -257,13 +257,16 @@ class UnifiedCtimeDiffusion(torch.nn.Module):
         return updated.detach()
     
     def sample_all(self, num_samples, batch_size, keep_nan_samples=False):        
-        b = batch_size
+        if num_samples < 1 or batch_size < 1:
+            raise ValueError('Sample count and batch size must be positive.')
 
         all_samples = []
         num_generated = 0
         while num_generated < num_samples:
             print(f"Samples left to generate: {num_samples-num_generated}")
-            sample = self.sample(b)
+            sample = self.sample(min(batch_size, num_samples - num_generated))
+            if not torch.isfinite(sample).all():
+                raise FloatingPointError('Diffusion sampling produced non-finite values.')
             mask_nan = torch.any(sample.isnan(), dim=1)
             if keep_nan_samples:
                 # If the sample instances that contains Nan are decided to be kept, the row with Nan will be foreced to all zeros
@@ -544,98 +547,5 @@ class UnifiedCtimeDiffusion(torch.nn.Module):
         return x_num_next, x_cat_next, q_xs
 
 
-    def sample_impute(self, x_num, x_cat, num_mask_idx, cat_mask_idx, resample_rounds, impute_condition, w_num, w_cat):
-        self.w_num = w_num
-        self.w_cat = w_cat
-        self.num_mask_idx = num_mask_idx
-        self.cat_mask_idx = cat_mask_idx
-        
-        b = x_num.size(0)
-        device = self.device
-        dtype = torch.float32
 
-        # Create masks, true for the missing columns
-        num_mask = [i in num_mask_idx for i in range(self.num_numerical_features)]
-        cat_mask = [i in cat_mask_idx for i in range(len(self.num_classes))]
-        num_mask = torch.tensor(num_mask).to(x_num.device).to(x_num.dtype)
-        cat_mask = torch.tensor(cat_mask).to(x_cat.device).to(x_cat.dtype)
-
-        # Create the chain of t
-        t = torch.linspace(0,1,self.num_timesteps, dtype=dtype, device=device)      # times = 0.0,...,1.0
-        t = t[:, None]
-        
-        # Compute the chains of sigma
-        sigma_num_cur = self.num_schedule.total_noise(t)
-        sigma_cat_cur = self.cat_schedule.total_noise(t)
-        sigma_num_next = torch.zeros_like(sigma_num_cur)
-        sigma_num_next[1:] = sigma_num_cur[0:-1]
-        sigma_cat_next = torch.zeros_like(sigma_cat_cur)
-        sigma_cat_next[1:] = sigma_cat_cur[0:-1]
-        
-        # Prepare sigma_hat for stochastic sampling mode
-        if self.sampler_params['stochastic_sampler']:
-            gamma = min(S_churn / self.num_timesteps, np.sqrt(2) - 1) * (S_min <= sigma_num_cur) * (sigma_num_cur <= S_max)
-            sigma_num_hat = sigma_num_cur + gamma * sigma_num_cur
-            t_hat = self.num_schedule.inverse_to_t(sigma_num_hat)
-            t_hat = torch.min(t_hat, dim=-1, keepdim=True).values    # take the samllest t_hat induced by sigma_num
-            zero_gamma = (gamma==0).any()
-            t_hat[zero_gamma] = t[zero_gamma]
-            out_of_bound = (t_hat > 1).squeeze()
-            sigma_num_hat[out_of_bound] = sigma_num_cur[out_of_bound]
-            t_hat[out_of_bound] = t[out_of_bound]
-            sigma_cat_hat = self.cat_schedule.total_noise(t_hat)
-        else:
-            t_hat = t
-            sigma_num_hat = sigma_num_cur
-            sigma_cat_hat = sigma_cat_cur
-
-        # Sample priors for the continuous dimensions
-        if impute_condition == "x_t":
-            z_norm = x_num + torch.randn((b, self.num_numerical_features), device=device) * sigma_num_cur[-1]   # z_{t_max} = x_0(masked) + sigma_max*epsilon
-        elif impute_condition == "x_0":
-            z_norm = x_num
-            
-        # Sample priors for the discrete dimensions
-        has_cat = len(self.num_classes) > 0
-        z_cat = torch.zeros((b, 0), device=device).float()      # the default values for categorical sample if the dataset has no categorical entry
-        if has_cat:
-            if impute_condition == "x_t":
-                z_cat = self._sample_masked_prior(
-                    b,
-                    len(self.num_classes),
-                )   # z_{t_max} is still all pushed to [MASK]
-            elif impute_condition == "x_0":
-                z_cat = x_cat
-        
-        pbar = tqdm(reversed(range(0, self.num_timesteps)), total=self.num_timesteps)
-        pbar.set_description(f"Sampling Progress")
-        for i in pbar:
-            for u in range (resample_rounds):
-                # Get known parts by Forward Flow
-                if impute_condition == "x_t":
-                    z_norm_known = x_num + torch.randn((b, self.num_numerical_features), device=device) * sigma_num_next[i]
-                    move_chance = 1 - torch.exp(-sigma_cat_next[i]) if i < (self.num_timesteps-1) else torch.ones_like(sigma_cat_next[i])     # force move_chance to be 1 for the first iteration
-                    z_cat_known, _ = self.q_xt(x_cat, move_chance)
-                elif impute_condition == "x_0":
-                    z_norm_known = x_num
-                    z_cat_known = x_cat
-                
-                # Get unknown by Reverse Step
-                z_norm_unknown, z_cat_unknown, q_xs = self.edm_update(
-                    z_norm, z_cat, i, 
-                    t[i], t[i-1] if i > 0 else None, t_hat[i],
-                    sigma_num_cur[i], sigma_num_next[i], sigma_num_hat[i], 
-                    sigma_cat_cur[i], sigma_cat_next[i], sigma_cat_hat[i],
-                )
-                z_norm = (1 - num_mask)  * z_norm_known + num_mask * z_norm_unknown
-                z_cat = (1 - cat_mask) * z_cat_known + cat_mask * z_cat_unknown
-
-                # Resample x_t from x_{t-1} by Foward Step
-                if u < resample_rounds-1:
-                    z_norm = z_norm + (sigma_num_cur[i] ** 2 - sigma_num_next[i] ** 2).sqrt() * S_noise * torch.randn_like(z_norm)
-                    move_chance = -torch.expm1(sigma_cat_next[i] - sigma_cat_cur[i])
-                    z_cat, _ = self.q_xt(z_cat, move_chance)
-        
-        sample = torch.cat([z_norm, z_cat], dim=1).cpu()
-        return sample
     

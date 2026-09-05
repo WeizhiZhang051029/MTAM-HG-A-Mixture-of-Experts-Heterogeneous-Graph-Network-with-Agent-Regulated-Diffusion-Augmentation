@@ -156,7 +156,6 @@ def load_config_overrides(path: str | None) -> None:
             "synthetic_agent_dropout": "SYNTHETIC_AGENT_DROPOUT",
             "synthetic_agent_epochs": "SYNTHETIC_AGENT_EPOCHS",
             "synthetic_agent_lr": "SYNTHETIC_AGENT_LR",
-            "cbtg_cross_run_validation_std_path": "CBTG_CROSS_RUN_VALIDATION_STD_PATH",
             "synthetic_confidence_threshold": "SYNTHETIC_CONFIDENCE_THRESHOLD",
             "synthetic_pretrain_confidence_threshold": "SYNTHETIC_PRETRAIN_CONFIDENCE_THRESHOLD",
             "synthetic_save_diagnostics": "SYNTHETIC_SAVE_DIAGNOSTICS",
@@ -311,7 +310,6 @@ def apply_cli_overrides(args: argparse.Namespace) -> None:
         "synthetic_agent_dropout": "SYNTHETIC_AGENT_DROPOUT",
         "synthetic_agent_epochs": "SYNTHETIC_AGENT_EPOCHS",
         "synthetic_agent_lr": "SYNTHETIC_AGENT_LR",
-        "cbtg_cross_run_validation_std_path": "CBTG_CROSS_RUN_VALIDATION_STD_PATH",
         "scientific_code_sha256": "EXPECTED_SCIENTIFIC_CODE_SHA256",
         "generation_protocol_sha256": "EXPECTED_GENERATION_PROTOCOL_SHA256",
         "synthetic_confidence_threshold": "SYNTHETIC_CONFIDENCE_THRESHOLD",
@@ -460,7 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--split_seed",
         type=int,
         default=None,
-        help="Fixed train/validation/test partition seed; independent of the model seed.",
+        help="Partition seed; defaults to the model seed.",
     )
     parser.add_argument(
         "--generation_seed",
@@ -493,7 +491,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synthetic_agent_dropout", type=float, default=None)
     parser.add_argument("--synthetic_agent_epochs", type=int, default=None)
     parser.add_argument("--synthetic_agent_lr", type=float, default=None)
-    parser.add_argument("--cbtg_cross_run_validation_std_path", default=None)
     parser.add_argument("--scientific_code_sha256", default="")
     parser.add_argument("--generation_protocol_sha256", default="")
     parser.add_argument("--synthetic_confidence_threshold", type=float, default=None)
@@ -568,8 +565,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split_method", choices=["stratified_random", "chronological"], default="")
     parser.add_argument("--no_el", action="store_true", help="Exclude EL from input nodes.")
     parser.add_argument("--no_laplace", action="store_true", help="Use deterministic MSE regression.")
+    parser.add_argument("--require_existing_synthetic", action="store_true")
     parser.add_argument("--allow_synthetic", action="store_true", help="Allow synthetic data for development smoke tests only.")
-    parser.add_argument("--debug_overfit_small_batch", action="store_true", help="Train on a fixed 32-sample batch for 300-epoch sanity check.")
     parser.add_argument("--early_stopping_patience", type=int, default=None)
     parser.add_argument("--min_delta", type=float, default=None)
     return parser
@@ -655,6 +652,12 @@ def main() -> None:
     args = parser.parse_args()
     load_config_overrides(args.config)
     apply_cli_overrides(args)
+    if args.split_seed is None:
+        config.SPLIT_SEED = config.SEED
+    if args.mode in {"generate_synthetic_tabdiff", SUPERVISED_MAIN_TRAIN_MODE}:
+        config.TABDIFF_DATANAME = f"capl_split_{config.SPLIT_SEED}"
+        config.TABDIFF_DATA_DIR = str(Path(config.TABDIFF_DATA_DIR) / f"split_{config.SPLIT_SEED}")
+        config.TABDIFF_OUTPUT_DIR = str(Path(config.TABDIFF_OUTPUT_DIR) / f"split_{config.SPLIT_SEED}")
     if args.mode != "generate_synthetic_tabdiff":
         append_run_timestamp_to_output_dir()
 
@@ -671,7 +674,7 @@ def main() -> None:
         synthetic_path = Path(config.SYNTHETIC_DATA_PATH)
         if not synthetic_path.is_absolute():
             synthetic_path = config.PROJECT_ROOT / synthetic_path
-        if bool(getattr(config, "USE_TABDIFF_GENERATION", False)) and "smoke" not in synthetic_path.name.lower():
+        if bool(getattr(config, "USE_TABDIFF_GENERATION", False)):
             regenerate = not synthetic_path.exists()
             if not regenerate:
                 try:
@@ -689,6 +692,8 @@ def main() -> None:
                     print(f"[Protocol] Existing synthetic data cannot be reused: {exc}")
                     regenerate = True
             if regenerate:
+                if args.require_existing_synthetic:
+                    raise RuntimeError("Existing synthetic data is missing or belongs to another split.")
                 run_generate_synthetic_tabdiff(args)
 
     data_bundle = create_dataloaders(
@@ -701,13 +706,6 @@ def main() -> None:
         split_method=config.SPLIT_METHOD,
         allow_synthetic=args.allow_synthetic,
     )
-
-    if args.debug_overfit_small_batch:
-        from train import run_small_batch_overfit
-
-        result = run_small_batch_overfit(data_bundle, epochs=args.epochs or config.SMALL_BATCH_OVERFIT_EPOCHS)
-        print(result)
-        return
 
     if args.mode == "evaluate":
         metrics = run_evaluate(data_bundle, args.checkpoint or str(config.CHECKPOINT_DIR / "best_model.pth"))

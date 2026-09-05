@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -33,8 +32,7 @@ from training.cbtg import (
     calibrate_quality_agent_on_real,
     compute_dynamic_synthetic_weights,
     dynamic_synthetic_refresh_due,
-    evaluate_validation_pretrain_feedback,
-    load_cross_run_validation_stats,
+    evaluate_training_feedback,
     paper_cbtg_agent_loss,
     quality_agent_updates_enabled,
     select_top_synthetic_indices,
@@ -98,21 +96,21 @@ def test_formal_protocol_rejects_missing_config_hash(monkeypatch: pytest.MonkeyP
         _config_sha256(required=True)
 
 
-def test_five_metrics_use_lower_is_better_orientation() -> None:
+def test_four_metrics_use_lower_is_better_orientation() -> None:
     y = np.array([1.0, 2.0, 4.0, 8.0])
     oriented = _paper_oriented_metrics(y, y, (2.0, 4.0))
 
-    assert oriented.shape == (5,)
+    assert oriented.shape == (4,)
     assert np.allclose(oriented, 0.0, atol=1.0e-10)
 
 
 def test_feedback_state_has_four_standardized_values_per_metric_and_clipped_reward() -> None:
-    overall = np.array([6.0, 4.4, 2.8, 0.09, 3.4])
-    run_std = np.array([0.24, 0.21, 0.18, 0.008, 0.49])
+    overall = np.array([6.0, 4.4, 2.8, 0.09])
+    run_std = np.array([0.24, 0.21, 0.18, 0.008])
     per_cluster = np.array(
         [
-            [5.0, 3.8, 2.5, 0.07, 2.7],
-            [8.0, 5.9, 4.0, 0.17, 6.2],
+            [5.0, 3.8, 2.5, 0.07],
+            [8.0, 5.9, 4.0, 0.17],
         ]
     )
 
@@ -123,9 +121,9 @@ def test_feedback_state_has_four_standardized_values_per_metric_and_clipped_rewa
         np.array([0, 1, 1], dtype=np.int64),
     )
 
-    assert len(AGENT_FEEDBACK_FEATURE_NAMES) == 5 * 4
-    assert result["raw_state"].shape == (3, 5, 4)
-    assert result["features"].shape == (3, 20)
+    assert len(AGENT_FEEDBACK_FEATURE_NAMES) == 4 * 4
+    assert result["raw_state"].shape == (3, 4, 4)
+    assert result["features"].shape == (3, 16)
     assert np.allclose(result["raw_state"][0, :, 0], overall)
     assert np.allclose(result["raw_state"][0, :, 1], run_std)
     assert np.allclose(result["raw_state"][0, :, 2], per_cluster[0])
@@ -192,7 +190,7 @@ def test_initial_warmup_keeps_all_candidates_instead_of_first_sixty_percent() ->
     )
     data = SimpleNamespace(y_train_raw=np.arange(n, dtype=np.float64))
 
-    state = build_dynamic_synthetic_state(synthetic, data, np.zeros(5, dtype=np.float64))
+    state = build_dynamic_synthetic_state(synthetic, data)
 
     assert state.selected_indices.tolist() == list(range(n))
     assert state.selected_mask.all()
@@ -223,86 +221,34 @@ class _TwoClusters:
         return torch.from_numpy(self.predict(x.detach().cpu().numpy())).long()
 
 
-def test_dynamic_feedback_uses_injected_cross_run_validation_std() -> None:
+def test_dynamic_feedback_computes_history_std_on_training_only() -> None:
     x = np.array([[1.0], [2.0], [10.0], [20.0]], dtype=np.float32)
     dataset = CAPLDataset(x, x.copy(), np.arange(4))
     data = SimpleNamespace(
-        val_loader=DataLoader(dataset, batch_size=2, shuffle=False),
+        train_loader=DataLoader(dataset, batch_size=2, shuffle=False),
+        val_loader=None,
         y_scaler=_IdentityScaler(),
         tail_thresholds=(2.0, 10.0),
     )
     model = _ScaleModel(1.0)
-    run_std = np.array([0.2, 0.1, 0.3, 0.01, 0.4], dtype=np.float64)
+    history = []
     original_standardize = config.STANDARDIZE_Y
     config.STANDARDIZE_Y = True
     try:
-        first = evaluate_validation_pretrain_feedback(
-            model, data, torch.device("cpu"), run_std, cluster_model=_TwoClusters()
+        first = evaluate_training_feedback(
+            model, data, torch.device("cpu"), history, cluster_model=_TwoClusters()
         )
         model.scale.data.fill_(0.5)
-        second = evaluate_validation_pretrain_feedback(
-            model, data, torch.device("cpu"), run_std, cluster_model=_TwoClusters()
+        second = evaluate_training_feedback(
+            model, data, torch.device("cpu"), history, cluster_model=_TwoClusters()
         )
     finally:
         config.STANDARDIZE_Y = original_standardize
 
     assert np.allclose(first["overall_metrics"], 0.0, atol=1.0e-10)
-    assert np.allclose(first["run_std"], run_std)
-    assert np.allclose(second["run_std"], run_std)
+    assert np.allclose(first["run_std"], 0.0)
+    assert np.allclose(second["run_std"], np.std(np.stack(history), axis=0, ddof=1))
     assert np.any(np.asarray(second["overall_metrics"]) > 0.0)
-
-
-def test_cross_run_validation_stats_require_independent_matching_split(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = tmp_path / "validation_std.json"
-    run_metrics = [
-        [float(seed), float(seed + 1), float(seed + 2), seed / 100.0, float(seed + 3)]
-        for seed in range(10)
-    ]
-    path.write_text(
-        json.dumps(
-            {
-                "format": "mtam_hg_cbtg_cross_run_v1",
-                "source": "independent_validation_runs",
-                "partition": "validation",
-                "ddof": 1,
-                "metric_names": ["RMSE", "MAE", "MAPE", "ONE_MINUS_R2", "TAIL_MAE"],
-                "validation_metric_std": np.std(run_metrics, axis=0, ddof=1).tolist(),
-                "num_runs": 10,
-                "combined_split_sha256": "a" * 64,
-                "source_data_sha256": "c" * 64,
-                "config_sha256": "b" * 64,
-                "producer_protocol_sha256": "d" * 64,
-                "runs": [
-                    {
-                        "metrics_artifact_sha256": f"{index:064x}",
-                        "validation_metrics": metrics,
-                    }
-                    for index, metrics in enumerate(run_metrics, start=1)
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(config, "CONFIG_SHA256", "b" * 64)
-    stats = load_cross_run_validation_stats(
-        SimpleNamespace(combined_split_hash="a" * 64, source_sha256="c" * 64),
-        path,
-    )
-
-    assert stats.num_runs == 10
-    assert np.allclose(stats.metric_std, np.std(run_metrics, axis=0, ddof=1))
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["source"] = "refresh_epochs"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="independent validation runs"):
-        load_cross_run_validation_stats(
-            SimpleNamespace(combined_split_hash="a" * 64, source_sha256="c" * 64),
-            path,
-        )
 
 
 def test_synthetic_pretrain_optimizer_uses_one_paper_learning_rate(
@@ -391,12 +337,12 @@ def test_real_domain_calibration_updates_quality_agent_without_test_rows(
         torch.device("cpu"),
         1,
         optimizer=optimizer,
-        cross_run_validation_std=np.array([0.2, 0.1, 0.3, 0.01, 0.4]),
+        feedback_history=[],
         cluster_model=_TwoClusters(),
     )
 
     assert np.isfinite(logs["real_cbtg_agent_loss"])
-    assert logs["real_cbtg_validation_tail_mae"] > 0.0
+    assert logs["real_cbtg_training_mae"] > 0.0
     assert not torch.equal(before, agent.logit.detach())
     weights = batch_weight_fn(dataset.x[:2], dataset.y[:2])
     assert weights.shape == (2, 1)

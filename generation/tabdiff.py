@@ -33,7 +33,7 @@ def tabdiff_repo_path(path: str | Path | None = None) -> Path:
 
 def require_tabdiff_repo(path: str | Path | None = None) -> Path:
     repo = tabdiff_repo_path(path)
-    required = [repo / "README.md", repo / "main.py", repo / "process_dataset.py", repo / "tabdiff"]
+    required = [repo / "main.py", repo / "process_dataset.py", repo / "tabdiff", repo / "LICENSE"]
     missing = [str(item) for item in required if not item.exists()]
     if missing:
         clone_hint = f"git clone https://github.com/MinkaiXu/TabDiff.git {repo}"

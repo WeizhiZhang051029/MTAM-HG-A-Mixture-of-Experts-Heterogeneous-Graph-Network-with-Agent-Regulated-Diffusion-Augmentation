@@ -11,4 +11,3 @@ tomli>=2,<3
 tomli-w>=1,<2
 icecream>=2.1,<3
 wandb>=0.17,<1
-sdmetrics>=0.18,<1

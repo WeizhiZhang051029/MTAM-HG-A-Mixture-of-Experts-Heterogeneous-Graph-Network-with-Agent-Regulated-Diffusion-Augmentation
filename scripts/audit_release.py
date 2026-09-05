@@ -39,6 +39,8 @@ SECRET_PATTERNS = {
 
 
 def tracked_files() -> list[str]:
+    if not (ROOT / ".git").exists():
+        return [str(p.relative_to(ROOT)) for p in ROOT.rglob("*") if p.is_file() and not any(part in {"__pycache__", ".pytest_cache", ".ruff_cache"} for part in p.parts)]
     result = subprocess.run(
         ["git", "ls-files", "-z"], cwd=ROOT, check=True, capture_output=True
     )
@@ -81,9 +83,6 @@ def audit() -> list[str]:
 
 
 def main() -> int:
-    if not (ROOT / ".git").exists():
-        print("release audit requires a Git working tree", file=sys.stderr)
-        return 2
     failures = audit()
     if failures:
         print("release audit failed:", file=sys.stderr)
