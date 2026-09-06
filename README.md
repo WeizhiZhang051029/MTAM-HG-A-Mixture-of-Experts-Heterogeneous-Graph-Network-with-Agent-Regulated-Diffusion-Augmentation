@@ -39,7 +39,7 @@ To address these challenges, **MTAM-HG** integrates mechanism-prior diffusion au
 
 The MTAM-HG framework comprises two main modules:
 
-* **Agent-regulated diffusion augmentation:** MP-TabDiff embeds furnace-temperature trajectories, production-window constraints, and an empirical yield-strength prior into tabular diffusion to generate process-consistent candidate samples. CBTG-Agent dynamically perceives operating-condition characteristics and training states, and adaptively regulates synthetic samples through iterative decision-making, feedback, selection, and reweighting.
+* ** Agent-regulated diffusion augmentation:** MP-TabDiff embeds furnace-temperature trajectories, production-window constraints, and an empirical yield-strength prior into tabular diffusion to generate process-consistent samples. CBTG-Agent dynamically perceives operating conditions and training states, and regulates synthetic samples through iterative decision-making, feedback, selection, and reweighting.
 
 * **MoE-IPOHGN prediction:** MoE-IPOHGN represents CAPL variables within an implicit process-order heterogeneous graph and captures condition-dependent variable interactions. A Hard Sparse Gate (HSG) adaptively activates specialized experts for different operating conditions, enabling sample-dependent yield-strength prediction.
 * 
@@ -104,7 +104,7 @@ For each run, the data are stratified by yield strength and split into training,
 
 All preprocessing statistics, operating-condition clustering, and MP-TabDiff training are fitted exclusively on the corresponding real training partition. CBTG-Agent uses feedback from the real training set, the validation set is reserved for model selection and early stopping, and the test set is used only for final evaluation.
 
-Results are reported for each run and summarized as the mean ± sample standard deviation. Statistical significance is evaluated using a two-sided paired Wilcoxon signed-rank test with Holm correction across matched runs (\(p_{\mathrm{adj}}<0.05\)). This repository provides the main MTAM-HG experimental pipeline.
+Results are reported for each run and summarized as the mean ± sample standard deviation. Statistical significance is evaluated using a two-sided paired Wilcoxon signed-rank test with Holm correction across matched runs, with adjusted p < 0.05 considered statistically significant. This repository provides the main MTAM-HG experimental pipeline.
 
 ---
 
