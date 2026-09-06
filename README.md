@@ -37,12 +37,12 @@ Yield strength is a key quality indicator in continuous annealing production lin
 
 To address these challenges, **MTAM-HG** integrates mechanism-prior diffusion augmentation, feedback-driven sample regulation, and heterogeneous graph mixture-of-experts prediction within a unified framework.
 
-The framework consists of two main modules:
+The MTAM-HG framework comprises two main modules:
 
-* **MP-TabDiff with CBTG-Agent for data augmentation:** MP-TabDiff incorporates furnace temperature paths, production windows, and empirical yield-strength constraints into tabular diffusion to generate process-consistent candidate samples. CBTG-Agent then regulates these samples using downstream prediction feedback, dynamically selecting and reweighting them across different operating conditions.
+* **Agent-regulated diffusion augmentation:** MP-TabDiff embeds furnace-temperature trajectories, production-window constraints, and an empirical yield-strength prior into tabular diffusion to generate process-consistent candidate samples. CBTG-Agent dynamically perceives operating-condition characteristics and training states, and adaptively regulates synthetic samples through iterative decision-making, feedback, selection, and reweighting.
 
-* **MoE-IPOHGN for yield strength prediction:** MoE-IPOHGN models process-order dependencies among CAPL variables through a heterogeneous graph and employs a Hard Sparse Gate (HSG) to activate specialized experts according to different operating conditions.
-
+* **MoE-IPOHGN prediction:** MoE-IPOHGN represents CAPL variables within an implicit process-order heterogeneous graph and captures condition-dependent variable interactions. A Hard Sparse Gate (HSG) adaptively activates specialized experts for different operating conditions, enabling sample-dependent yield-strength prediction.
+* 
 Experiments on real CAPL production data demonstrate that MTAM-HG improves prediction accuracy and cross-condition stability over competitive baselines, while maintaining reliable performance under data scarcity.
 
 ---
