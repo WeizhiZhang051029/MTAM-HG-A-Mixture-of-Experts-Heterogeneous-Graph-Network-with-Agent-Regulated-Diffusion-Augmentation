@@ -37,11 +37,11 @@ Yield strength is a key quality indicator in continuous annealing production lin
 
 To address these challenges, **MTAM-HG** integrates mechanism-prior diffusion augmentation, feedback-driven sample regulation, and heterogeneous graph mixture-of-experts prediction within a unified framework.
 
-The framework consists of three main components:
+The framework consists of two main modules:
 
-* **MP-TabDiff** incorporates furnace temperature paths, production windows, and empirical yield-strength constraints into tabular diffusion to generate process-consistent candidate samples.
-* **CBTG-Agent** regulates the synthetic samples using downstream prediction feedback across different operating conditions, dynamically selecting and reweighting samples according to their training value.
-* **MoE-IPOHGN** models process-order dependencies among CAPL variables through a heterogeneous graph and uses a Hard Sparse Gate (HSG) to activate specialized experts for different operating conditions.
+* **MP-TabDiff with CBTG-Agent for data augmentation:** MP-TabDiff incorporates furnace temperature paths, production windows, and empirical yield-strength constraints into tabular diffusion to generate process-consistent candidate samples. CBTG-Agent then regulates these samples using downstream prediction feedback, dynamically selecting and reweighting them across different operating conditions.
+
+* **MoE-IPOHGN for yield strength prediction:** MoE-IPOHGN models process-order dependencies among CAPL variables through a heterogeneous graph and employs a Hard Sparse Gate (HSG) to activate specialized experts according to different operating conditions.
 
 Experiments on real CAPL production data demonstrate that MTAM-HG improves prediction accuracy and cross-condition stability over competitive baselines, while maintaining reliable performance under data scarcity.
 
@@ -95,13 +95,16 @@ Strip yield strength prediction
 The test set is isolated throughout model development and is used only for final evaluation.
 
 ---
+
 ## 📊 Experimental Protocol
 
-Experiments are conducted on **600 real production records** collected from a continuous annealing production line. Each record contains **21 routinely measured CAPL variables** covering operational, process, and conditional information, with the final strip yield strength used as the prediction target.
+Experiments use **600 real CAPL production records**, each containing **21 routinely measured process variables** and strip yield strength as the prediction target. Owing to industrial confidentiality, the raw dataset is not publicly released.
 
-The data are stratified by yield strength and divided into training, validation, and test sets using a **70% / 15% / 15%** split. All competing methods follow the same data partition and preprocessing protocol. Each model is independently evaluated over **10 runs**, and the results reported in this README correspond to the mean test performance.
+For each run, the data are stratified by yield strength and split into training, validation, and test sets at **70% / 15% / 15%**. The run seed determines both the data partition and model initialization. The default protocol uses **10 independent runs**.
 
-To prevent information leakage, preprocessing, standardization, operating-condition clustering, synthetic-sample generation, and model selection are performed without access to the held-out test set.
+All preprocessing statistics, operating-condition clustering, and MP-TabDiff training are fitted exclusively on the corresponding real training partition. CBTG-Agent uses feedback from the real training set, the validation set is reserved for model selection and early stopping, and the test set is used only for final evaluation.
+
+Results are reported for each run and summarized as the mean ± sample standard deviation. Statistical significance is evaluated using a two-sided paired Wilcoxon signed-rank test with Holm correction across matched runs (\(p_{\mathrm{adj}}<0.05\)). This repository provides the main MTAM-HG experimental pipeline.
 
 ---
 
@@ -238,6 +241,13 @@ MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Di
 │   └── test_*.py
 ├── third_party/
 │   └── TabDiff/
+│       ├── LICENSE
+│       ├── main.py
+│       ├── process_dataset.py
+│       ├── utils_train.py
+│       ├── tabdiff.yaml
+│       ├── src/
+│       └── tabdiff/
 ├── training/
 │   ├── cbtg.py
 │   └── clusters.py
@@ -245,6 +255,10 @@ MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Di
 │   ├── graph.py
 │   ├── logger.py
 │   └── seed.py
+├── .gitattributes
+├── .gitignore
+├── CITATION.cff
+├── THIRD_PARTY_NOTICES.md
 ├── config.py
 ├── config_loader.py
 ├── dataset.py
@@ -263,13 +277,16 @@ MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Di
 
 The main components are organized as follows:
 
-- `run_experiment.py`: locked entry point for the ten-run main experiment
-- `generation/`: MP-TabDiff preparation, training, sampling, and provenance-checked postprocessing
-- `models/`: graph structure learning, IPOHGN experts, sparse routing, and MR-LoRA adaptation
-- `training/`: CBTG-Agent optimization and working-condition cluster balancing
-- `protocol.py` and `protocol_integrity.py`: experiment-contract validation and artifact-integrity checks
-- `pipeline.py`, `train.py`, and `evaluate.py`: command-line orchestration, model training, and evaluation
-- `tests/`: model, training, protocol, integrity, and reproducibility checks
+- `run_experiment.py`: main experiment runner with configurable seeds and result aggregation
+- `generation/`: MP-TabDiff training and synthetic-sample generation for each training partition
+- `models/`: heterogeneous graph experts, sparse routing, and MR-LoRA adaptation
+- `training/`: CBTG-Agent regulation, synthetic pretraining, and real-domain calibration
+- `protocol.py`: default experiment settings
+- `protocol_integrity.py`: data-partition and synthetic-data provenance checks
+- `pipeline.py`, `train.py`, and `evaluate.py`: workflow orchestration, training, and evaluation
+- `tests/`: implementation, reproducibility, and optional end-to-end checks
+- `third_party/TabDiff/`: adapted TabDiff implementation and its original license
+- `scripts/audit_release.py`: checks for private data, model artifacts, and credential indicators in release files
 
 ---
 
