@@ -366,7 +366,6 @@ If you find this repository useful in your research, please consider citing our 
 ```bibtex
 @article{zhang2026mtamhg,
   title   = {MTAM-HG: A Mixture-of-Experts Heterogeneous Graph Network with Agent-Regulated Diffusion Augmentation for Strip Yield Strength Prediction},
-  author  = {Zhang, Weizhi and Li, Yiteng and Xie, Yuhan and Zhang, Jingchuan and Pan, Jianfei and Wang, Xinran and Wang, Xianpeng},
   journal = {Expert Systems with Applications},
   year    = {2026},
 }
