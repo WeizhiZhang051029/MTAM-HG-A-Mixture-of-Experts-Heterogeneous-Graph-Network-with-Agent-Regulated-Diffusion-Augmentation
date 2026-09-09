@@ -98,13 +98,13 @@ The test set is isolated throughout model development and is used only for final
 
 ## 📊 Experimental Protocol
 
-Experiments use **600 real CAPL production records**, each containing **21 routinely measured process variables** and strip yield strength as the prediction target. Owing to industrial confidentiality, the raw dataset is not publicly released.
+Experiments use **600 real CAPL production records** with **21 process variables** and yield strength as the prediction target. The raw industrial data cannot be publicly released due to confidentiality.
 
-For each run, the data are stratified by yield strength and split into training, validation, and test sets at **70% / 15% / 15%**. The run seed determines both the data partition and model initialization. The default protocol uses **10 independent runs**.
+For each of **10 independent runs**, the data are stratified by yield strength and split into training/validation/test sets at **70%/15%/15%**, with the run seed controlling both data partitioning and model initialization.
 
-All preprocessing statistics, operating-condition clustering, and MP-TabDiff training are fitted exclusively on the corresponding real training partition. CBTG-Agent uses feedback from the real training set, the validation set is reserved for model selection and early stopping, and the test set is used only for final evaluation.
+All preprocessing, clustering, and synthetic-data generation are fitted only on the corresponding real training set. CBTG-Agent uses training-set feedback, while validation is used for model selection and early stopping; the test set is reserved for final evaluation.
 
-Results are reported for each run and summarized as the mean ± sample standard deviation. Statistical significance is evaluated using a two-sided paired Wilcoxon signed-rank test with Holm correction across matched runs, with adjusted p < 0.05 considered statistically significant. This repository provides the main MTAM-HG experimental pipeline.
+Results are reported as **mean ± standard deviation**. Statistical significance is assessed using a **two-sided paired Wilcoxon signed-rank test with Holm correction** (\(p_{\mathrm{adj}}<0.05\)).
 
 ---
 
