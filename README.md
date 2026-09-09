@@ -192,13 +192,13 @@ python run_experiment.py \
 
 The pipeline sequentially:
 
-1. partitions and preprocesses the real CAPL data;
-2. trains MP-TabDiff on the training partition;
-3. generates mechanism-constrained candidate samples;
-4. regulates synthetic samples using CBTG-Agent;
-5. pretrains MoE-IPOHGN on the selected synthetic samples;
-6. performs real-domain calibration;
-7. selects the model according to validation performance;
+1. partitions and preprocesses the real CAPL data.
+2. trains MP-TabDiff on the training partition.
+3. generates mechanism-constrained candidate samples.
+4. regulates synthetic samples using CBTG-Agent.
+5. pretrains MoE-IPOHGN on the selected synthetic samples.
+6. performs real-domain calibration.
+7. selects the model according to validation performance.
 8. evaluates the final model on the held-out test set.
 
 ### Check the Experiment Configuration
@@ -305,12 +305,12 @@ outputs/
 
 Each independent run stores the corresponding:
 
-* model checkpoints;
-* prediction results;
-* evaluation metrics;
-* expert-routing statistics;
-* CBTG-Agent sample-selection records;
-* training logs;
+* model checkpoints.
+* prediction results.
+* evaluation metrics.
+* expert-routing statistics.
+* CBTG-Agent sample-selection records.
+* training logs.
 * preprocessing and experiment metadata.
 
 With the default configuration, the main experiment outputs are organized as follows (representative files shown):
