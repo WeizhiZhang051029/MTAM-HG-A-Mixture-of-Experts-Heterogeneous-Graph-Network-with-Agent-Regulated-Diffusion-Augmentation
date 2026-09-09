@@ -1,5 +1,3 @@
-"""MTAM-HG experiment configuration."""
-
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -273,7 +271,6 @@ USE_LAPLACE = False
 EXPERIMENT_NAME = "default"
 
 
-
 BATCH_SIZE = 32
 EPOCHS = 50
 LR = 1.0e-3
@@ -327,7 +324,7 @@ TAIL_QUANTILE = 0.10
 
 
 def active_node_names(use_el_as_input: bool | None = None) -> list[str]:
-    """Return graph nodes after applying EL and virtual quality switches."""
+
     if use_el_as_input is None:
         use_el_as_input = USE_EL_AS_INPUT
     if use_el_as_input:
@@ -339,9 +336,27 @@ def active_node_names(use_el_as_input: bool | None = None) -> list[str]:
 
 
 def input_node_names(use_el_as_input: bool | None = None) -> list[str]:
-    """Return real CAPL input variables only, excluding virtual nodes."""
+
     if use_el_as_input is None:
         use_el_as_input = USE_EL_AS_INPUT
     if use_el_as_input:
         return list(NODE_NAMES)
     return [name for name in NODE_NAMES if name != "EL"]
+
+
+RGCN_VECTORIZED = False
+FAST_SKIP_REDUNDANT_REAL_FORWARD = False
+FAST_SKIP_REFRESH_DIAGNOSTICS = False
+
+RGCN_BASIS_FACTORIZED = False
+
+FAST_SDPA = False
+FAST_CACHE_POSITIONAL_ENCODING = False
+
+FAST_COMPILE_PRETRAIN = False
+
+
+FAST_FUSED_PRETRAIN_OPTIMIZER = False
+
+
+FEEDBACK_EVAL_BATCH_SIZE = 0

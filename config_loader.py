@@ -1,5 +1,3 @@
-"""Configuration loading for the MTAM-HG main experiment."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -68,7 +66,7 @@ def _fallback_yaml(text: str) -> dict[str, Any]:
 
 
 def load_yaml_config_text(text: str) -> dict[str, Any]:
-    """Parse YAML text with the bundled fallback."""
+
     try:
         import yaml  # type: ignore
     except ImportError:

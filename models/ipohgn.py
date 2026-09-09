@@ -1,4 +1,4 @@
-"""IPOHGN graph encoder for MTAM-HG experts."""
+"""Process-order heterogeneous graph encoder."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def _sinusoid_encoding_table(length: int, d_model: int, device: torch.device, dt
 
 
 class ProcessOrderAttention(nn.Module):
-    """Multi-head attention across the ordered CAPL variable sequence [B, N, D]."""
+
 
     def __init__(self, d_model: int, num_heads: int) -> None:
         super().__init__()
@@ -61,19 +61,24 @@ class ProcessOrderAttention(nn.Module):
         q = self.W_Q(x).view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.W_K(x).view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.W_V(x).view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
-        attn = torch.softmax(scores, dim=-1)
-        context = torch.matmul(attn, v)
+        if getattr(config, "FAST_SDPA", False):
+            context = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        else:
+            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            attn = torch.softmax(scores, dim=-1)
+            context = torch.matmul(attn, v)
         context = context.transpose(1, 2).reshape(batch_size, sequence_length, self.d_model)
         return self.fc_out(context)
 
 
 class ProcessOrderTransformer(nn.Module):
-    """Transformer over variables sorted by their implicit CAPL process order."""
+
 
     def __init__(self, d_model: int, num_heads: int, dropout: float, forward_expansion: int = 2) -> None:
         super().__init__()
         self.attention = ProcessOrderAttention(d_model, num_heads)
+        self.register_buffer("_position_cache", torch.empty(0), persistent=False)
+        self._position_cache_key = None
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
@@ -87,7 +92,16 @@ class ProcessOrderTransformer(nn.Module):
         if x.ndim != 3:
             raise ValueError(f"Process-order transformer expects [B, N, D], got {tuple(x.shape)}.")
         _, sequence_length, d_model = x.shape
-        pos = _sinusoid_encoding_table(sequence_length, d_model, x.device, x.dtype).unsqueeze(0)
+        if getattr(config, "FAST_CACHE_POSITIONAL_ENCODING", False):
+            key = (sequence_length, d_model, x.device, x.dtype)
+            if self._position_cache_key != key:
+                self._position_cache = _sinusoid_encoding_table(
+                    sequence_length, d_model, x.device, x.dtype
+                ).unsqueeze(0)
+                self._position_cache_key = key
+            pos = self._position_cache
+        else:
+            pos = _sinusoid_encoding_table(sequence_length, d_model, x.device, x.dtype).unsqueeze(0)
         query = x + pos
         attention = self.attention(query)
         h = self.dropout(self.norm1(attention + query))
@@ -117,18 +131,47 @@ class RelationalGraphConv(nn.Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
-    def forward(self, A_het: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        weights = torch.einsum("rb,bio->rio", self.w_rel, self.w_bases)
-        supports = []
+    def _basis_forward(self, A_het: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+
         eye = torch.eye(A_het.shape[-1], device=A_het.device, dtype=A_het.dtype)
-        for rel_id in range(self.num_relations):
-            rel_A = A_het[rel_id] * (1.0 - eye)
-            message = torch.einsum("ij,bjd->bid", rel_A, x)
-            supports.append(message)
-        A_base = A_het.sum(dim=0)
-        self_A = torch.diag_embed(torch.diagonal(A_base))
-        supports.append(torch.einsum("ij,bjd->bid", self_A, x))
-        stacked = torch.cat(supports, dim=-1)
+        off_diagonal = A_het[:self.num_relations] * (1.0 - eye)
+        self_adjacency = torch.diag_embed(torch.diagonal(A_het.sum(dim=0)))
+        adjacency = torch.cat((off_diagonal, self_adjacency.unsqueeze(0)), dim=0)
+        basis_adjacency = torch.einsum("rk,rij->kij", self.w_rel, adjacency)
+        supports = torch.einsum("kij,bjd->bikd", basis_adjacency, x)
+        out = torch.matmul(
+            supports.reshape(x.shape[0], x.shape[1], -1).float(),
+            self.w_bases.reshape(-1, self.d_model).float(),
+        ).to(x.dtype)
+        return out if self.bias is None else out + self.bias.to(out.dtype)
+
+    def forward(self, A_het: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if getattr(config, "RGCN_BASIS_FACTORIZED", False):
+            return self._basis_forward(A_het, x)
+        weights = torch.einsum("rb,bio->rio", self.w_rel, self.w_bases)
+
+
+        if getattr(config, "RGCN_VECTORIZED", False):
+            eye = torch.eye(A_het.shape[-1], device=A_het.device, dtype=A_het.dtype)
+
+            relation_adjacency = A_het[:self.num_relations] * (1.0 - eye)
+            messages = torch.einsum("rij,bjd->bird", relation_adjacency, x)
+            relation_support = messages.reshape(x.shape[0], x.shape[1], -1)
+            self_A = torch.diag_embed(torch.diagonal(A_het.sum(dim=0)))
+            self_support = torch.einsum("ij,bjd->bid", self_A, x)
+            stacked = torch.cat((relation_support, self_support), dim=-1)
+        else:
+            supports = []
+            eye = torch.eye(A_het.shape[-1], device=A_het.device, dtype=A_het.dtype)
+            off_diagonal = 1.0 - eye
+            for rel_id in range(self.num_relations):
+                rel_A = A_het[rel_id] * off_diagonal
+                message = torch.einsum("ij,bjd->bid", rel_A, x)
+                supports.append(message)
+            A_base = A_het.sum(dim=0)
+            self_A = torch.diag_embed(torch.diagonal(A_base))
+            supports.append(torch.einsum("ij,bjd->bid", self_A, x))
+            stacked = torch.cat(supports, dim=-1)
         out = torch.matmul(stacked.float(), weights.reshape(-1, self.d_model).float()).to(dtype=x.dtype)
         if self.bias is not None:
             out = out + self.bias.to(out.dtype)
@@ -136,7 +179,7 @@ class RelationalGraphConv(nn.Module):
 
 
 class IPOHGNBlock(nn.Module):
-    """One IPOHGN block: process-order attention followed by relational convolution."""
+
 
     def __init__(self, d_model: int, num_relations: int, num_heads: int, dropout: float) -> None:
         super().__init__()
@@ -161,7 +204,7 @@ class IPOHGNBlock(nn.Module):
 
 
 class IPOHGNExpert(nn.Module):
-    """IPOHGN expert used by MTAM-HG."""
+
 
     def __init__(
         self,

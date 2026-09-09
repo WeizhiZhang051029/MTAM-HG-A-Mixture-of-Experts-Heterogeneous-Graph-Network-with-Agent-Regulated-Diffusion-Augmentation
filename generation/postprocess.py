@@ -1,5 +1,3 @@
-"""Convert TabDiff samples to the CAPL training schema."""
-
 from __future__ import annotations
 
 import argparse

@@ -1,4 +1,4 @@
-﻿"""Run MTAM-HG training, generation, or evaluation."""
+﻿"""MTAM-HG training and evaluation orchestration."""
 
 from __future__ import annotations
 
@@ -46,12 +46,66 @@ def set_output_dir(path: str) -> None:
 
 
 def append_run_timestamp_to_output_dir() -> None:
-    """Create a timestamped run directory under the configured output root."""
+
     current = Path(config.OUTPUT_DIR)
     if re.fullmatch(r"\d{8}_\d{6}", current.name):
         return
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     set_output_dir(str(current / timestamp))
+
+
+_YAML_CONFIG_MAPPING = {key: key.upper() for key in """
+    rgcn_vectorized rgcn_basis_factorized fast_sdpa fast_compile_pretrain
+    feedback_eval_batch_size fast_fused_pretrain_optimizer fast_cache_positional_encoding
+    fast_skip_redundant_real_forward fast_skip_refresh_diagnostics data_path batch_size
+    epochs lr weight_decay dropout seed split_seed split_method generation_seed
+    graph_backbone_layers top_k lambda_moe moe_aux_lambda moe_gate_temperature
+    moe_balance_prob_lambda moe_balance_usage_lambda moe_entropy_reg_lambda
+    expert_calibration_lambda expert_diversity_lambda expert_calibration_quality_lambda
+    expert_calibration_quality_index num_experts agent_hidden_dim agent_dropout
+    agent_use_process_features agent_reason_dim agent_reliability_routing_lambda
+    agent_confidence_reg_lambda use_agent_reward agent_reward_lambda reward_alpha_error
+    reward_alpha_uncertainty reward_alpha_entropy reward_alpha_tail reward_clamp_min
+    reward_clamp_max target_confidence_mean confidence_mean_reg_lambda
+    confidence_entropy_reg_lambda tail_quantile_low tail_quantile_high tail_threshold_mode
+    use_tabdiff_generation tabdiff_repo_path tabdiff_data_dir tabdiff_output_dir
+    tabdiff_dataname tabdiff_exp_name tabdiff_num_samples tabdiff_train_epochs
+    tabdiff_low_tail_ratio tabdiff_high_tail_ratio tabdiff_gpu tabdiff_ckpt_path
+    tabdiff_mechanism_constraint tabdiff_mechanism_lambda tabdiff_guidance_scale
+    tabdiff_mechanism_temperature_hold_tolerance tabdiff_mechanism_yield_tolerance
+    tabdiff_trainable_scope tabdiff_min_save_epoch tabdiff_finetune_lr
+    tabdiff_finetune_steps tabdiff_num_timesteps_override tabdiff_stochastic_sampler
+    early_stopping_patience min_delta use_synthetic_pretrain synthetic_data_path
+    synthetic_label_col synthetic_pretrain_epochs synthetic_batch_size
+    synthetic_use_agent_weight synthetic_use_reward_loss synthetic_agent_hidden_dim
+    synthetic_agent_attention_dim synthetic_agent_attention_heads synthetic_agent_dropout
+    synthetic_agent_epochs synthetic_agent_lr synthetic_confidence_threshold
+    synthetic_pretrain_confidence_threshold synthetic_save_diagnostics
+    synthetic_use_process_consistency synthetic_process_consistency_threshold
+    synthetic_process_range_quantile_low synthetic_process_range_quantile_high
+    synthetic_process_range_margin synthetic_process_knn_k synthetic_process_range_weight
+    synthetic_process_manifold_weight synthetic_process_label_weight
+    synthetic_process_score_power synthetic_use_mechanism_consistency
+    synthetic_mechanism_score_power synthetic_reward_mse_weight
+    synthetic_reward_process_weight synthetic_reward_mechanism_weight
+    use_dynamic_synthetic_agent dynamic_synthetic_refresh_epochs
+    dynamic_synthetic_warmup_epochs dynamic_synthetic_use_sampler
+    dynamic_synthetic_use_loss_weight dynamic_synthetic_top_ratio
+    dynamic_synthetic_weight_min dynamic_synthetic_weight_max dynamic_synthetic_ema
+    dynamic_synthetic_error_weight dynamic_synthetic_train_region_weight
+    dynamic_synthetic_scarcity_weight dynamic_synthetic_real_feedback_weight
+    dynamic_synthetic_quota_strength dynamic_synthetic_quota_min dynamic_synthetic_quota_max
+    dynamic_synthetic_reliability_floor dynamic_synthetic_scarcity_bins
+    dynamic_synthetic_process_power dynamic_synthetic_mechanism_power
+    dynamic_synthetic_train_reward_metric dynamic_synthetic_train_tail_lambda
+    use_layerwise_finetune_lr finetune_backbone_lr finetune_head_lr finetune_agent_lr
+    finetune_quality_agent_lr freeze_finetune_backbone finetune_trainable_keywords
+    use_mr_lora mr_lora_scope mr_lora_rank_graph mr_lora_rank_routing mr_lora_alpha_graph
+    mr_lora_alpha_routing mr_lora_dropout mr_lora_train_output_head
+    use_cluster_balance_reward num_working_condition_clusters cluster_balance_lambda
+    reward_alpha_cluster checkpoint_selection_metric checkpoint_tail_mae_lambda
+""".split()}
+_YAML_CONFIG_MAPPING.update({'generation_seed': 'TABDIFF_GENERATION_SEED', 'min_delta': 'EARLY_STOPPING_MIN_DELTA'})
 
 
 def load_config_overrides(path: str | None) -> None:
@@ -74,150 +128,7 @@ def load_config_overrides(path: str | None) -> None:
             config.EXPERIMENT_NAME = str(loaded["experiment_name"])
         if loaded.get("output_base"):
             set_output_dir(str(loaded["output_base"]))
-        mapping = {
-            "data_path": "DATA_PATH",
-            "batch_size": "BATCH_SIZE",
-            "epochs": "EPOCHS",
-            "lr": "LR",
-            "weight_decay": "WEIGHT_DECAY",
-            "dropout": "DROPOUT",
-            "seed": "SEED",
-            "split_seed": "SPLIT_SEED",
-            "split_method": "SPLIT_METHOD",
-            "generation_seed": "TABDIFF_GENERATION_SEED",
-            "graph_backbone_layers": "GRAPH_BACKBONE_LAYERS",
-            "top_k": "TOP_K",
-            "lambda_moe": "LAMBDA_MOE",
-            "moe_aux_lambda": "MOE_AUX_LAMBDA",
-            "moe_gate_temperature": "MOE_GATE_TEMPERATURE",
-            "moe_balance_prob_lambda": "MOE_BALANCE_PROB_LAMBDA",
-            "moe_balance_usage_lambda": "MOE_BALANCE_USAGE_LAMBDA",
-            "moe_entropy_reg_lambda": "MOE_ENTROPY_REG_LAMBDA",
-            "expert_calibration_lambda": "EXPERT_CALIBRATION_LAMBDA",
-            "expert_diversity_lambda": "EXPERT_DIVERSITY_LAMBDA",
-            "expert_calibration_quality_lambda": "EXPERT_CALIBRATION_QUALITY_LAMBDA",
-            "expert_calibration_quality_index": "EXPERT_CALIBRATION_QUALITY_INDEX",
-            "num_experts": "NUM_EXPERTS",
-            "agent_hidden_dim": "AGENT_HIDDEN_DIM",
-            "agent_dropout": "AGENT_DROPOUT",
-            "agent_use_process_features": "AGENT_USE_PROCESS_FEATURES",
-            "agent_reason_dim": "AGENT_REASON_DIM",
-            "agent_reliability_routing_lambda": "AGENT_RELIABILITY_ROUTING_LAMBDA",
-            "agent_confidence_reg_lambda": "AGENT_CONFIDENCE_REG_LAMBDA",
-            "use_agent_reward": "USE_AGENT_REWARD",
-            "agent_reward_lambda": "AGENT_REWARD_LAMBDA",
-            "reward_alpha_error": "REWARD_ALPHA_ERROR",
-            "reward_alpha_uncertainty": "REWARD_ALPHA_UNCERTAINTY",
-            "reward_alpha_entropy": "REWARD_ALPHA_ENTROPY",
-            "reward_alpha_tail": "REWARD_ALPHA_TAIL",
-            "reward_clamp_min": "REWARD_CLAMP_MIN",
-            "reward_clamp_max": "REWARD_CLAMP_MAX",
-            "target_confidence_mean": "TARGET_CONFIDENCE_MEAN",
-            "confidence_mean_reg_lambda": "CONFIDENCE_MEAN_REG_LAMBDA",
-            "confidence_entropy_reg_lambda": "CONFIDENCE_ENTROPY_REG_LAMBDA",
-            "tail_quantile_low": "TAIL_QUANTILE_LOW",
-            "tail_quantile_high": "TAIL_QUANTILE_HIGH",
-            "tail_threshold_mode": "TAIL_THRESHOLD_MODE",
-            "use_tabdiff_generation": "USE_TABDIFF_GENERATION",
-            "tabdiff_repo_path": "TABDIFF_REPO_PATH",
-            "tabdiff_data_dir": "TABDIFF_DATA_DIR",
-            "tabdiff_output_dir": "TABDIFF_OUTPUT_DIR",
-            "tabdiff_dataname": "TABDIFF_DATANAME",
-            "tabdiff_exp_name": "TABDIFF_EXP_NAME",
-            "tabdiff_num_samples": "TABDIFF_NUM_SAMPLES",
-            "tabdiff_train_epochs": "TABDIFF_TRAIN_EPOCHS",
-            "tabdiff_low_tail_ratio": "TABDIFF_LOW_TAIL_RATIO",
-            "tabdiff_high_tail_ratio": "TABDIFF_HIGH_TAIL_RATIO",
-            "tabdiff_gpu": "TABDIFF_GPU",
-            "tabdiff_ckpt_path": "TABDIFF_CKPT_PATH",
-            "tabdiff_mechanism_constraint": "TABDIFF_MECHANISM_CONSTRAINT",
-            "tabdiff_mechanism_lambda": "TABDIFF_MECHANISM_LAMBDA",
-            "tabdiff_guidance_scale": "TABDIFF_GUIDANCE_SCALE",
-            "tabdiff_mechanism_temperature_hold_tolerance": "TABDIFF_MECHANISM_TEMPERATURE_HOLD_TOLERANCE",
-            "tabdiff_mechanism_yield_tolerance": "TABDIFF_MECHANISM_YIELD_TOLERANCE",
-            "tabdiff_trainable_scope": "TABDIFF_TRAINABLE_SCOPE",
-            "tabdiff_min_save_epoch": "TABDIFF_MIN_SAVE_EPOCH",
-            "tabdiff_finetune_lr": "TABDIFF_FINETUNE_LR",
-            "tabdiff_finetune_steps": "TABDIFF_FINETUNE_STEPS",
-            "tabdiff_num_timesteps_override": "TABDIFF_NUM_TIMESTEPS_OVERRIDE",
-            "tabdiff_stochastic_sampler": "TABDIFF_STOCHASTIC_SAMPLER",
-            "early_stopping_patience": "EARLY_STOPPING_PATIENCE",
-            "min_delta": "EARLY_STOPPING_MIN_DELTA",
-            "use_synthetic_pretrain": "USE_SYNTHETIC_PRETRAIN",
-            "synthetic_data_path": "SYNTHETIC_DATA_PATH",
-            "synthetic_label_col": "SYNTHETIC_LABEL_COL",
-            "synthetic_pretrain_epochs": "SYNTHETIC_PRETRAIN_EPOCHS",
-            "synthetic_batch_size": "SYNTHETIC_BATCH_SIZE",
-            "synthetic_use_agent_weight": "SYNTHETIC_USE_AGENT_WEIGHT",
-            "synthetic_use_reward_loss": "SYNTHETIC_USE_REWARD_LOSS",
-            "synthetic_agent_hidden_dim": "SYNTHETIC_AGENT_HIDDEN_DIM",
-            "synthetic_agent_attention_dim": "SYNTHETIC_AGENT_ATTENTION_DIM",
-            "synthetic_agent_attention_heads": "SYNTHETIC_AGENT_ATTENTION_HEADS",
-            "synthetic_agent_dropout": "SYNTHETIC_AGENT_DROPOUT",
-            "synthetic_agent_epochs": "SYNTHETIC_AGENT_EPOCHS",
-            "synthetic_agent_lr": "SYNTHETIC_AGENT_LR",
-            "synthetic_confidence_threshold": "SYNTHETIC_CONFIDENCE_THRESHOLD",
-            "synthetic_pretrain_confidence_threshold": "SYNTHETIC_PRETRAIN_CONFIDENCE_THRESHOLD",
-            "synthetic_save_diagnostics": "SYNTHETIC_SAVE_DIAGNOSTICS",
-            "synthetic_use_process_consistency": "SYNTHETIC_USE_PROCESS_CONSISTENCY",
-            "synthetic_process_consistency_threshold": "SYNTHETIC_PROCESS_CONSISTENCY_THRESHOLD",
-            "synthetic_process_range_quantile_low": "SYNTHETIC_PROCESS_RANGE_QUANTILE_LOW",
-            "synthetic_process_range_quantile_high": "SYNTHETIC_PROCESS_RANGE_QUANTILE_HIGH",
-            "synthetic_process_range_margin": "SYNTHETIC_PROCESS_RANGE_MARGIN",
-            "synthetic_process_knn_k": "SYNTHETIC_PROCESS_KNN_K",
-            "synthetic_process_range_weight": "SYNTHETIC_PROCESS_RANGE_WEIGHT",
-            "synthetic_process_manifold_weight": "SYNTHETIC_PROCESS_MANIFOLD_WEIGHT",
-            "synthetic_process_label_weight": "SYNTHETIC_PROCESS_LABEL_WEIGHT",
-            "synthetic_process_score_power": "SYNTHETIC_PROCESS_SCORE_POWER",
-            "synthetic_use_mechanism_consistency": "SYNTHETIC_USE_MECHANISM_CONSISTENCY",
-            "synthetic_mechanism_score_power": "SYNTHETIC_MECHANISM_SCORE_POWER",
-            "synthetic_reward_mse_weight": "SYNTHETIC_REWARD_MSE_WEIGHT",
-            "synthetic_reward_process_weight": "SYNTHETIC_REWARD_PROCESS_WEIGHT",
-            "synthetic_reward_mechanism_weight": "SYNTHETIC_REWARD_MECHANISM_WEIGHT",
-            "use_dynamic_synthetic_agent": "USE_DYNAMIC_SYNTHETIC_AGENT",
-            "dynamic_synthetic_refresh_epochs": "DYNAMIC_SYNTHETIC_REFRESH_EPOCHS",
-            "dynamic_synthetic_warmup_epochs": "DYNAMIC_SYNTHETIC_WARMUP_EPOCHS",
-            "dynamic_synthetic_use_sampler": "DYNAMIC_SYNTHETIC_USE_SAMPLER",
-            "dynamic_synthetic_use_loss_weight": "DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT",
-            "dynamic_synthetic_top_ratio": "DYNAMIC_SYNTHETIC_TOP_RATIO",
-            "dynamic_synthetic_weight_min": "DYNAMIC_SYNTHETIC_WEIGHT_MIN",
-            "dynamic_synthetic_weight_max": "DYNAMIC_SYNTHETIC_WEIGHT_MAX",
-            "dynamic_synthetic_ema": "DYNAMIC_SYNTHETIC_EMA",
-            "dynamic_synthetic_error_weight": "DYNAMIC_SYNTHETIC_ERROR_WEIGHT",
-            "dynamic_synthetic_train_region_weight": "DYNAMIC_SYNTHETIC_TRAIN_REGION_WEIGHT",
-            "dynamic_synthetic_scarcity_weight": "DYNAMIC_SYNTHETIC_SCARCITY_WEIGHT",
-            "dynamic_synthetic_real_feedback_weight": "DYNAMIC_SYNTHETIC_REAL_FEEDBACK_WEIGHT",
-            "dynamic_synthetic_quota_strength": "DYNAMIC_SYNTHETIC_QUOTA_STRENGTH",
-            "dynamic_synthetic_quota_min": "DYNAMIC_SYNTHETIC_QUOTA_MIN",
-            "dynamic_synthetic_quota_max": "DYNAMIC_SYNTHETIC_QUOTA_MAX",
-            "dynamic_synthetic_reliability_floor": "DYNAMIC_SYNTHETIC_RELIABILITY_FLOOR",
-            "dynamic_synthetic_scarcity_bins": "DYNAMIC_SYNTHETIC_SCARCITY_BINS",
-            "dynamic_synthetic_process_power": "DYNAMIC_SYNTHETIC_PROCESS_POWER",
-            "dynamic_synthetic_mechanism_power": "DYNAMIC_SYNTHETIC_MECHANISM_POWER",
-            "dynamic_synthetic_train_reward_metric": "DYNAMIC_SYNTHETIC_TRAIN_REWARD_METRIC",
-            "dynamic_synthetic_train_tail_lambda": "DYNAMIC_SYNTHETIC_TRAIN_TAIL_LAMBDA",
-            "use_layerwise_finetune_lr": "USE_LAYERWISE_FINETUNE_LR",
-            "finetune_backbone_lr": "FINETUNE_BACKBONE_LR",
-            "finetune_head_lr": "FINETUNE_HEAD_LR",
-            "finetune_agent_lr": "FINETUNE_AGENT_LR",
-            "finetune_quality_agent_lr": "FINETUNE_QUALITY_AGENT_LR",
-            "freeze_finetune_backbone": "FREEZE_FINETUNE_BACKBONE",
-            "finetune_trainable_keywords": "FINETUNE_TRAINABLE_KEYWORDS",
-            "use_mr_lora": "USE_MR_LORA",
-            "mr_lora_scope": "MR_LORA_SCOPE",
-            "mr_lora_rank_graph": "MR_LORA_RANK_GRAPH",
-            "mr_lora_rank_routing": "MR_LORA_RANK_ROUTING",
-            "mr_lora_alpha_graph": "MR_LORA_ALPHA_GRAPH",
-            "mr_lora_alpha_routing": "MR_LORA_ALPHA_ROUTING",
-            "mr_lora_dropout": "MR_LORA_DROPOUT",
-            "mr_lora_train_output_head": "MR_LORA_TRAIN_OUTPUT_HEAD",
-            "use_cluster_balance_reward": "USE_CLUSTER_BALANCE_REWARD",
-            "num_working_condition_clusters": "NUM_WORKING_CONDITION_CLUSTERS",
-            "cluster_balance_lambda": "CLUSTER_BALANCE_LAMBDA",
-            "reward_alpha_cluster": "REWARD_ALPHA_CLUSTER",
-            "checkpoint_selection_metric": "CHECKPOINT_SELECTION_METRIC",
-            "checkpoint_tail_mae_lambda": "CHECKPOINT_TAIL_MAE_LAMBDA",
-        }
+        mapping = _YAML_CONFIG_MAPPING
         for key, value in loaded.items():
             if key in {"cli", "experiment_name", "output_base"}:
                 continue

@@ -1,5 +1,3 @@
-"""Reproducibility helpers."""
-
 from __future__ import annotations
 
 import os
@@ -10,7 +8,7 @@ import torch
 
 
 def set_seed(seed: int) -> None:
-    """Set Python, NumPy and PyTorch seeds."""
+
     random.seed(seed)
     np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)

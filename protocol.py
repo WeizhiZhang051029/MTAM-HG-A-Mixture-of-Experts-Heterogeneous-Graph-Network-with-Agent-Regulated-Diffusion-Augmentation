@@ -1,5 +1,3 @@
-"""Canonical constants for the released MTAM-HG experiment."""
-
 from __future__ import annotations
 
 DEFAULT_DATA_PATH = "data/CAPL.xlsx"

@@ -1,4 +1,4 @@
-"""Validate split-specific synthetic-data provenance."""
+"""Partition and synthetic-data provenance validation."""
 
 from __future__ import annotations
 
@@ -19,15 +19,15 @@ TABDIFF_DETERMINISTIC_SEED = 0
 
 
 class FileMutationError(RuntimeError):
-    """Raised when a file changes while its snapshot is in use."""
+    pass
 
 
 class SyntheticProvenanceError(RuntimeError):
-    """Raised when synthetic data cannot be tied to the active run protocol."""
+    pass
 
 
 class ProtocolIntegrityError(RuntimeError):
-    """Raised when a confirmatory protocol artifact is invalid."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,7 @@ class TableSnapshot:
 
 
 class ValidatedPreparedInput(dict[str, object]):
-    """Prepared metadata with the exact files it validated."""
+
 
     def __init__(
         self,
@@ -79,7 +79,7 @@ def capture_file_snapshot(
     *,
     include_content: bool = False,
 ) -> FileSnapshot:
-    """Hash one stable file snapshot, retaining bytes only when requested."""
+
     resolved = Path(path).resolve()
     digest = hashlib.sha256()
     chunks: list[bytes] | None = [] if include_content else None
@@ -107,14 +107,14 @@ def capture_file_snapshot(
 
 
 def assert_file_snapshot_current(snapshot: FileSnapshot, label: str = "file") -> None:
-    """Fail if a path no longer contains the captured bytes."""
+
     current = capture_file_snapshot(snapshot.path)
     if current.sha256 != snapshot.sha256:
         raise FileMutationError(f"{label} changed during use: {snapshot.path}")
 
 
 def read_table_snapshot(path: str | Path) -> TableSnapshot:
-    """Parse a table from the bytes used for its SHA-256 digest."""
+
     snapshot = capture_file_snapshot(path, include_content=True)
     assert snapshot.content is not None
     suffix = snapshot.path.suffix.lower()
@@ -142,17 +142,17 @@ def _canonical_json(value: object) -> bytes:
 
 
 def canonical_sha256(value: object) -> str:
-    """Return a stable SHA-256 digest for a JSON-serializable value."""
+
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
 def file_sha256(path: str | Path) -> str:
-    """Return the SHA-256 digest of one stable file snapshot."""
+
     return capture_file_snapshot(path).sha256
 
 
 def scientific_code_sha256(project_root: str | Path | None = None) -> str:
-    """Fingerprint the scientific Python implementation."""
+
     root = Path(project_root).resolve() if project_root is not None else Path(__file__).resolve().parent
     source_files = [path for path in root.glob("*.py") if path.is_file()]
     for directory in ("generation", "models", "training", "utils", "third_party/TabDiff"):
@@ -174,12 +174,12 @@ def scientific_code_sha256(project_root: str | Path | None = None) -> str:
 
 
 def schema_sha256(columns: Sequence[object]) -> str:
-    """Fingerprint an ordered model-table schema."""
+
     return canonical_sha256([str(column) for column in columns])
 
 
 def sample_ids_sha256(sample_ids: Sequence[int] | np.ndarray) -> str:
-    """Fingerprint ordered sample membership independently of NumPy dtype."""
+
     values = [int(value) for value in np.asarray(sample_ids).reshape(-1)]
     return canonical_sha256(values)
 
@@ -191,7 +191,7 @@ def split_fingerprints(
     *,
     total_rows: int,
 ) -> tuple[dict[str, str], str]:
-    """Validate a complete partition and return per-split and combined hashes."""
+
     split_arrays = {
         "train": np.asarray(train_ids, dtype=np.int64).reshape(-1),
         "val": np.asarray(val_ids, dtype=np.int64).reshape(-1),
@@ -232,7 +232,7 @@ def split_fingerprints(
 
 
 def generation_config_snapshot() -> dict[str, object]:
-    """Capture the TabDiff settings that determine the generated table."""
+
     import config
 
     names = (
@@ -265,7 +265,7 @@ def generation_config_snapshot() -> dict[str, object]:
 
 
 def synthetic_provenance_path(synthetic_path: str | Path) -> Path:
-    """Return the JSON sidecar path for a synthetic table."""
+
     path = Path(synthetic_path)
     return path.with_suffix(".provenance.json")
 
@@ -280,7 +280,7 @@ def _project_path(path: str | Path) -> Path:
 
 
 def validate_prepared_tabdiff_input(metadata_path: str | Path) -> dict[str, object]:
-    """Validate the exact CSV exposed to TabDiff before preprocessing it."""
+
     metadata_file = Path(metadata_path).resolve()
     try:
         metadata_snapshot = capture_file_snapshot(metadata_file, include_content=True)
@@ -578,7 +578,7 @@ def validate_synthetic_provenance_for_runner(
     expected_scientific_code_sha256: str | None = None,
     expected_generation_protocol_sha256: str | None = None,
 ) -> dict[str, object]:
-    """Validate runner source, split, and synthetic provenance."""
+
     import config
     from dataset import (
         _resolve_data_path,
@@ -637,7 +637,7 @@ def validate_synthetic_provenance_for_data_bundle(
     expected_scientific_code_sha256: str | None = None,
     expected_generation_protocol_sha256: str | None = None,
 ) -> dict[str, object]:
-    """Validate immediately before loading synthetic samples for training."""
+
     return _validate_common(
         _project_path(synthetic_path),
         source_sha256=str(getattr(data_bundle, "source_sha256")),

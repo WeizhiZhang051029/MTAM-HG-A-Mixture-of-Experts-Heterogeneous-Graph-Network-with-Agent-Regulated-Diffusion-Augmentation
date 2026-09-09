@@ -1,4 +1,4 @@
-"""Prepare the fixed CAPL training split for TabDiff."""
+"""Prepare TabDiff inputs using only the real training partition."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def prepare_tabdiff_data(
     split_method: str | None = None,
     generation_seed: int | None = None,
 ) -> dict[str, object]:
-    """Prepare the training split and TabDiff metadata."""
+
     resolved_data_path = _resolve_data_path(data_path or config.DATA_PATH)
     source_snapshot = _read_table_snapshot(resolved_data_path)
     df = source_snapshot.frame.copy()

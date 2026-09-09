@@ -1,5 +1,3 @@
-"""Build graph schemas, priors, and relation templates."""
-
 from __future__ import annotations
 
 import numpy as np
@@ -26,7 +24,7 @@ def build_stage_ids(node_names: list[str] | None = None) -> torch.LongTensor:
 
 
 def build_process_order_ids(node_names: list[str] | None = None) -> torch.LongTensor:
-    """Return process-order ids for graph nodes."""
+
     node_names = node_names or config.active_node_names()
     order_lookup: dict[str, int] = {}
     for order_name, names in config.PROCESS_ORDER_NODE_MAP.items():
@@ -49,7 +47,7 @@ def build_mechanistic_prior_graph(
     same_type_weight: float = 0.08,
     self_loop_weight: float = 1.0,
 ) -> np.ndarray:
-    """Build the metallurgical prior graph."""
+
     node_names = node_names or config.active_node_names()
     n = len(node_names)
     node_to_idx = {name: idx for idx, name in enumerate(node_names)}
@@ -83,7 +81,7 @@ def build_mechanistic_prior_graph(
 
 
 def build_relation_templates(node_names: list[str] | None = None) -> tuple[torch.FloatTensor, list[tuple[str, str]]]:
-    """Build heterogeneous relation templates."""
+
     node_names = node_names or config.active_node_names()
     type_ids = build_node_type_ids(node_names)
     templates = []
@@ -101,5 +99,5 @@ def build_relation_templates(node_names: list[str] | None = None) -> tuple[torch
 
 
 def row_normalize_adjacency(A: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
-    """Row-normalize adjacency so incoming weights for each target sum to one."""
+
     return A / (A.sum(dim=-1, keepdim=True) + eps)

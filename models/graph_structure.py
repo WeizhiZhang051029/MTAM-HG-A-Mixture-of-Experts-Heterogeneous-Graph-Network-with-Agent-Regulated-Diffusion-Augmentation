@@ -1,5 +1,3 @@
-"""Knowledge-guided heterogeneous graph construction."""
-
 from __future__ import annotations
 
 import torch
@@ -7,7 +5,7 @@ import torch.nn as nn
 
 
 class KnowledgeGuidedHeteroGraphLearning(nn.Module):
-    """Generate knowledge-guided heterogeneous adjacency matrices."""
+
 
     def __init__(
         self,

@@ -1,5 +1,3 @@
-"""Small logging helpers used by training and evaluation."""
-
 from __future__ import annotations
 
 import csv

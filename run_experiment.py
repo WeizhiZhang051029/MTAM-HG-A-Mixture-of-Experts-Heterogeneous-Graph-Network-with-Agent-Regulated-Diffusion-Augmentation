@@ -1,5 +1,3 @@
-"""Run the paper-aligned MTAM-HG main experiment."""
-
 from __future__ import annotations
 
 import argparse
@@ -323,7 +321,7 @@ def append_optional_cli_args(
     args: argparse.Namespace,
     specs: list[tuple[str, str]] | None = None,
 ) -> list[str]:
-    """Append non-empty experiment values to a child pipeline command."""
+
     for attr_name, flag in (specs or ()):
         value = getattr(args, attr_name, None)
         if isinstance(value, bool):
@@ -412,7 +410,6 @@ def build_main_train_command(
             ]
         )
     return cmd
-
 
 
 def seed_template_path(template: str, seed: int) -> str:

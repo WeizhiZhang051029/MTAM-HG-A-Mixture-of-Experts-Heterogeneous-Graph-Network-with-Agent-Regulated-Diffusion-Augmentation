@@ -1,4 +1,4 @@
-"""Load and split CAPL tabular data."""
+"""CAPL loading, train-only preprocessing, and partition construction."""
 
 from __future__ import annotations
 
@@ -56,6 +56,15 @@ class CAPLDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.x[idx], self.y[idx], self.sample_ids[idx]
+
+    def __getitems__(self, indices: list[int]) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+
+        if type(self) is not CAPLDataset:
+            return [self[idx] for idx in indices]
+        idx = torch.as_tensor(indices, dtype=torch.long)
+        return list(zip(
+            self.x[idx].unbind(0), self.y[idx].unbind(0), self.sample_ids[idx].unbind(0)
+        ))
 
 
 @dataclass
@@ -243,7 +252,7 @@ def _allocate_by_capacity(capacities: np.ndarray, target: int) -> np.ndarray:
 
 
 def _stratified_random_split_indices(y: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Stratified random split by binned yield strength."""
+
     y_flat = y.reshape(-1)
     n = len(y_flat)
     n_train_target, n_val_target, _ = _split_target_counts(n)

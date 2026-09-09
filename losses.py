@@ -1,5 +1,3 @@
-"""Loss functions for robust yield strength prediction."""
-
 from __future__ import annotations
 
 from typing import Iterable
@@ -7,10 +5,11 @@ from typing import Iterable
 import torch
 
 import config
+from utils.tensor_logging import scalar_logs
 
 
 def weighted_mse_loss(mu: torch.Tensor, y: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-    """Weighted MSE for deterministic regression."""
+
     err = (mu - y) ** 2
     if weights is not None:
         err = err * weights
@@ -24,7 +23,7 @@ def laplace_nll_loss(
     weights: torch.Tensor | None = None,
     eps: float | None = None,
 ) -> torch.Tensor:
-    """Compute Laplace negative log likelihood."""
+
     eps = config.LAPLACE_EPS if eps is None else eps
     scale = b + eps
     loss = torch.abs(y - mu) / scale + torch.log(scale)
@@ -34,7 +33,7 @@ def laplace_nll_loss(
 
 
 def moe_load_balance_loss(gate_weights_list: Iterable[torch.Tensor]) -> torch.Tensor:
-    """Reference MoE auxiliary loss: importance balance + load balance."""
+
     weights_list = list(gate_weights_list)
     device = weights_list[0].device if weights_list else None
     losses = []
@@ -53,7 +52,7 @@ def moe_load_balance_loss(gate_weights_list: Iterable[torch.Tensor]) -> torch.Te
 
 
 def graph_regularization_loss(A_kg: torch.Tensor, A0: torch.Tensor) -> torch.Tensor:
-    """Paper L_graph = ||A_kg - A0||_F^2."""
+
     return torch.sum((A_kg - A0) ** 2)
 
 
@@ -75,7 +74,7 @@ def expert_calibration_loss(
     y: torch.Tensor,
     weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Weakly supervise each expert so low-routed experts cannot drift."""
+
     target = y.unsqueeze(1).expand_as(expert_preds)
     err = (expert_preds - target) ** 2
     if weights is not None:
@@ -94,7 +93,7 @@ def _standardize_batch(values: torch.Tensor, eps: float = 1.0e-8) -> torch.Tenso
 
 
 def _batch_tail_indicator(y_true: torch.Tensor) -> torch.Tensor:
-    """Batch-quantile tail marker; can be replaced by train-set thresholds later."""
+
     y_flat = y_true.detach().reshape(-1)
     low_q = float(getattr(config, "TAIL_QUANTILE_LOW", getattr(config, "TAIL_QUANTILE", 0.10)))
     high_q = float(getattr(config, "TAIL_QUANTILE_HIGH", 1.0 - getattr(config, "TAIL_QUANTILE", 0.10)))
@@ -111,7 +110,7 @@ def compute_agent_reward(
     tail_indicator: torch.Tensor | None = None,
     cluster_labels: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute per-sample Agent rewards."""
+
     y_pred_flat = y_pred.reshape(y_pred.shape[0], -1)
     y_true_flat = y_true.reshape(y_true.shape[0], -1)
     per_sample_error = ((y_pred_flat - y_true_flat) ** 2).mean(dim=-1)
@@ -204,7 +203,7 @@ def compute_agent_reward_loss(
     tail_indicator: torch.Tensor | None = None,
     cluster_labels: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Reward objective for Agent sample confidence."""
+
     reward, components = compute_agent_reward(
         y_pred,
         y_true,
@@ -310,6 +309,11 @@ def _append_expert_logs(outputs: dict[str, torch.Tensor], logs: dict[str, float]
         logs["agent_gate_entropy"] = float(entropy.cpu())
 
 
+def batch_agent_reward_enabled(override: bool | None = None) -> bool:
+
+    return bool(getattr(config, "USE_AGENT_REWARD", False)) if override is None else bool(override)
+
+
 def total_loss(
     outputs: dict[str, torch.Tensor] | torch.Tensor,
     y: torch.Tensor,
@@ -320,8 +324,11 @@ def total_loss(
     cluster_labels: torch.Tensor | None = None,
     use_internal_agent_weight: bool | None = None,
     use_agent_reward: bool | None = None,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Compute the supervised training objective."""
+    *,
+    include_expert_logs: bool = True,
+    defer_logs: bool = False,
+) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
+
     outputs = _as_output_dict(outputs)
     configured_internal_agent_weight = (
         bool(getattr(config, "AGENT_USE_SAMPLE_WEIGHT_FOR_SUPERVISED_LOSS", False))
@@ -358,11 +365,7 @@ def total_loss(
         total = total + lambda_diversity * diversity_loss
     agent_reward_loss = torch.tensor(0.0, device=y.device)
     agent_logs: dict[str, float] = {}
-    use_batch_agent_reward = (
-        bool(getattr(config, "USE_AGENT_REWARD", False))
-        if use_agent_reward is None
-        else bool(use_agent_reward)
-    )
+    use_batch_agent_reward = batch_agent_reward_enabled(use_agent_reward)
     if (
         use_batch_agent_reward
         and "sample_confidence" in outputs
@@ -396,20 +399,23 @@ def total_loss(
         total = total + config.LAMBDA_GRAPH * graph_loss
 
     logs = {
-        "pred_loss": float(pred.detach().cpu()),
-        "moe_loss": float(moe.detach().cpu()),
-        "moe_aux_loss": float(moe.detach().cpu()),
-        "expert_calibration_loss": float(expert_calib.detach().cpu()),
-        "expert_diversity_loss": float(diversity_loss.detach().cpu()),
-        "mask_loss": 0.0,
-        "edge_loss": 0.0,
-        "graph_loss": float(graph_loss.detach().cpu()),
-        "confidence_reg_loss": float(confidence_reg.detach().cpu()),
-        "agent_reward_loss": agent_logs.get("agent_reward_loss", float(agent_reward_loss.detach().cpu())),
-        "agent_total_loss": agent_logs.get("agent_total_loss", float(agent_reward_loss.detach().cpu())),
-        "total_loss": float(total.detach().cpu()),
-        "batch_weight_mean": float(batch_weights.detach().mean().cpu()) if batch_weights is not None else 1.0,
+        'pred_loss': pred.detach(),
+        'moe_loss': moe.detach(),
+        'moe_aux_loss': moe.detach(),
+        'expert_calibration_loss': expert_calib.detach(),
+        'expert_diversity_loss': diversity_loss.detach(),
+        'mask_loss': 0.0,
+        'edge_loss': 0.0,
+        'graph_loss': graph_loss.detach(),
+        'confidence_reg_loss': confidence_reg.detach(),
+        'agent_reward_loss': agent_logs.get('agent_reward_loss', agent_reward_loss.detach()),
+        'agent_total_loss': agent_logs.get('agent_total_loss', agent_reward_loss.detach()),
+        'total_loss': total.detach(),
+        'batch_weight_mean': batch_weights.detach().mean() if batch_weights is not None else 1.0,
     }
+    if not defer_logs:
+        logs = scalar_logs(logs)
     logs.update(agent_logs)
-    _append_expert_logs(outputs, logs)
+    if include_expert_logs:
+        _append_expert_logs(outputs, logs)
     return total, logs

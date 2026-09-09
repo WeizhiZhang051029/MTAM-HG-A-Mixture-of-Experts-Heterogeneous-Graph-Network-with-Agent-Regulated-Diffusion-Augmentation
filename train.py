@@ -1,5 +1,3 @@
-"""Training loops for pretraining and supervised fine-tuning."""
-
 from __future__ import annotations
 
 import time
@@ -13,8 +11,9 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 import config
-from evaluate import evaluate_model
+from evaluate import evaluate_model, evaluate_model_and_loss
 from losses import (
+    batch_agent_reward_enabled,
     prediction_loss,
     total_loss,
 )
@@ -39,7 +38,7 @@ def count_total_parameters(model: torch.nn.Module) -> int:
 
 
 def moe_parameter_breakdown(model: torch.nn.Module) -> dict[str, float | int | str]:
-    """Estimate stored and per-sample routed parameters for MoE reporting."""
+
     total_params = count_total_parameters(model)
     trainable_params = count_trainable_parameters(model)
     if not hasattr(model, "experts"):
@@ -96,7 +95,7 @@ def configure_finetune_trainability(
     model: torch.nn.Module,
     freeze_backbone: bool | None = None,
 ) -> dict[str, object]:
-    """Freeze pretrained backbone parameters for the real-data calibration stage."""
+
     has_lora_params = any(".lora_" in name for name, _param in model.named_parameters())
     if bool(getattr(config, "USE_MR_LORA", False)) and has_lora_params:
         train_output_head = bool(getattr(config, "MR_LORA_TRAIN_OUTPUT_HEAD", False))
@@ -173,7 +172,7 @@ def configure_finetune_trainability(
 
 
 def maybe_enable_mr_lora(model: torch.nn.Module, device: torch.device | None = None) -> dict[str, object]:
-    """Inject MR-LoRA adapters only for explicitly requested real-domain fine-tuning."""
+
     if not bool(getattr(config, "USE_MR_LORA", False)):
         return {"enabled": False}
 
@@ -209,7 +208,7 @@ def maybe_enable_mr_lora(model: torch.nn.Module, device: torch.device | None = N
 
 
 def build_finetune_optimizer(model: torch.nn.Module) -> AdamW:
-    """AdamW with lower LR for pretrained graph backbones and higher LR for heads/gates."""
+
     if not bool(getattr(config, "USE_LAYERWISE_FINETUNE_LR", False)):
         return AdamW((p for p in model.parameters() if p.requires_grad), lr=config.LR, weight_decay=config.WEIGHT_DECAY)
 
@@ -260,6 +259,8 @@ def train_one_epoch(
     batch_weight_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     use_internal_agent_weight: bool | None = None,
     use_agent_reward: bool | None = None,
+    *,
+    clip_parameters: tuple[torch.nn.Parameter, ...] | None = None,
 ) -> dict[str, float]:
     model.train()
     accum: dict[str, float] = {}
@@ -268,7 +269,11 @@ def train_one_epoch(
         x = x.to(device)
         y = y.to(device)
         cluster_labels: torch.Tensor | None = None
-        if cluster_model is not None and cluster_model.is_fitted:
+        if (
+            batch_agent_reward_enabled(use_agent_reward)
+            and bool(getattr(config, "USE_CLUSTER_BALANCE_REWARD", False))
+            and cluster_model is not None and cluster_model.is_fitted
+        ):
             cluster_labels = cluster_model.predict_tensor(x).to(device)
         outputs = model(x)
         batch_weights: torch.Tensor | None = None
@@ -293,7 +298,9 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_NORM)
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters() if clip_parameters is None else clip_parameters, config.GRAD_CLIP_NORM, foreach=True
+        )
         optimizer.step()
 
         for key, value in logs.items():
@@ -317,7 +324,7 @@ def evaluate_prediction_loss(model, loader, device: torch.device) -> float:
 
 
 def split_metadata(data_bundle) -> dict[str, object]:
-    """Serializable split metadata for diagnostics and checkpoints."""
+
     return {
         "seed": int(data_bundle.model_seed),
         "model_seed": int(data_bundle.model_seed),
@@ -338,7 +345,7 @@ def split_metadata(data_bundle) -> dict[str, object]:
 
 
 def save_split_artifacts(data_bundle, output_dir: Path) -> None:
-    """Save train/val/test sample ids for run-level reproducibility."""
+
     output_dir.mkdir(parents=True, exist_ok=True)
     meta = split_metadata(data_bundle)
     save_json(output_dir / "split_indices.json", meta)
@@ -372,7 +379,7 @@ def checkpoint_payload(
     epoch: int,
     **extra: object,
 ) -> dict[str, object]:
-    """Standard .pth checkpoint payload used across training modes."""
+
     payload: dict[str, object] = {
         "model_state_dict": model.state_dict(),
         "epoch": int(epoch),
@@ -389,7 +396,7 @@ def checkpoint_payload(
 
 
 def checkpoint_selection_score(val_metrics: dict[str, float]) -> tuple[float, dict[str, float | str]]:
-    """Return the scalar checkpoint score and its components for validation metrics."""
+
     metric = str(getattr(config, "CHECKPOINT_SELECTION_METRIC", "rmse") or "rmse").lower()
     rmse = float(val_metrics.get("RMSE", float("inf")))
     tail_mae = float(val_metrics.get("TAIL_MAE", val_metrics.get("Tail_MAE", float("nan"))))
@@ -428,6 +435,8 @@ def supervised_finetune(
         ],
     ]
     | None = None,
+    *,
+    cluster_model: WorkingConditionCluster | None = None,
 ) -> tuple[float, int, int, bool]:
     if (quality_agent is None) != (quality_agent_calibration_fn is None):
         raise ValueError("quality_agent and quality_agent_calibration_fn must be provided together.")
@@ -443,15 +452,20 @@ def supervised_finetune(
     save_json(config.RESULT_DIR / "finetune_policy.json", finetune_policy)
     optimizer = build_finetune_optimizer(model)
 
-    cluster_model: WorkingConditionCluster | None = None
+
     if bool(getattr(config, "USE_CLUSTER_BALANCE_REWARD", False)):
-        train_dataset = data_bundle.train_loader.dataset
-        x_train_np = train_dataset.x.detach().cpu().numpy()
-        cluster_model = WorkingConditionCluster()
-        cluster_model.fit(x_train_np, data_bundle.y_train_raw)
+        if cluster_model is None:
+            train_dataset = data_bundle.train_loader.dataset
+            x_train_np = train_dataset.x.detach().cpu().numpy()
+            cluster_model = WorkingConditionCluster()
+            cluster_model.fit(x_train_np, data_bundle.y_train_raw)
+        elif not cluster_model.is_fitted:
+            raise ValueError("Supplied working-condition cluster must already be fitted.")
         finetune_policy["cluster_balance_enabled"] = True
         finetune_policy["num_working_condition_clusters"] = cluster_model.effective_n_clusters
         save_json(config.RESULT_DIR / "finetune_policy.json", finetune_policy)
+    else:
+        cluster_model = None
     best_score = float("inf")
     best_epoch = -1
     epochs_run = 0
@@ -487,11 +501,13 @@ def supervised_finetune(
             batch_weight_fn=batch_weight_fn,
             use_internal_agent_weight=False if quality_agent is not None else None,
             use_agent_reward=False if quality_agent is not None else None,
+            clip_parameters=tuple(model.parameters()),
         )
         train_metrics, _ = evaluate_model(model, data_bundle.train_loader, device, data_bundle)
-        val_metrics, _ = evaluate_model(model, data_bundle.val_loader, device, data_bundle)
+        val_metrics, _, val_loss = evaluate_model_and_loss(
+            model, data_bundle.val_loader, device, data_bundle,
+        )
         checkpoint_score, checkpoint_score_logs = checkpoint_selection_score(val_metrics)
-        val_loss = evaluate_prediction_loss(model, data_bundle.val_loader, device)
         row = {
             "epoch": epoch,
             "train_loss": train_logs.get("total_loss", float("nan")),
@@ -564,6 +580,11 @@ def supervised_finetune(
 
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: str | Path, device: torch.device) -> None:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    restore_model_checkpoint(model, checkpoint, device)
+
+
+def restore_model_checkpoint(model: torch.nn.Module, checkpoint: dict, device: torch.device) -> None:
+
     state = checkpoint.get("model_state_dict", checkpoint)
     has_lora_state = any(".lora_" in name for name in state)
     has_lora_model = bool(mr_lora_parameter_names(model))

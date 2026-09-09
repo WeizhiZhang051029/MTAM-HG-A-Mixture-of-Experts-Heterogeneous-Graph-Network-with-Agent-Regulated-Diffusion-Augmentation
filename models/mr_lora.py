@@ -1,4 +1,4 @@
-"""MR-LoRA adapters for real-domain calibration."""
+"""Low-rank adaptation for graph, attention, and routing layers."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class LoRAInjectionSummary:
 
 
 class LoRALinear(nn.Module):
-    """Wrap an existing Linear layer with a trainable low-rank residual branch."""
+
 
     def __init__(
         self,
@@ -79,7 +79,7 @@ MR_LORA_SCOPE_FAMILIES: dict[str, frozenset[str]] = {
 
 
 def mr_lora_scope_families(scope: str) -> frozenset[str]:
-    """Return the adapter families enabled by a validated scope name."""
+
 
     normalized = str(scope).strip().lower()
     try:
@@ -112,7 +112,7 @@ def inject_mr_lora(
     routing_alpha: float,
     dropout: float = 0.0,
 ) -> LoRAInjectionSummary:
-    """Inject graph, attention, and routing LoRA adapters."""
+
 
     graph_matches: list[str] = []
     attention_matches: list[str] = []

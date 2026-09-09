@@ -1,4 +1,4 @@
-"""MTAM-HG with four IPOHGN experts and reliability-aware Top-2 routing."""
+"""Heterogeneous graph mixture of experts with reliability-aware top-k routing."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ def _moe_aux_lambda() -> float:
 def router_load_balance_loss(
     gate_weights: torch.Tensor,
     gate_probs: torch.Tensor | None = None,
+    balance_coefficients: tuple[float, float, float] | None = None,
 ) -> torch.Tensor:
     """Balance sparse expert usage while keeping soft gate probabilities exploratory."""
     num_experts = gate_weights.shape[-1]
@@ -60,11 +61,14 @@ def router_load_balance_loss(
         max_entropy = torch.log(gate_probs.new_tensor(float(num_experts)))
         entropy_reg = (max_entropy - entropy) / (max_entropy + 1.0e-8)
 
-    return (
-        float(_cfg("MOE_BALANCE_USAGE_LAMBDA", 1.0)) * sparse_balance
-        + float(_cfg("MOE_BALANCE_PROB_LAMBDA", 0.5)) * prob_balance
-        + float(_cfg("MOE_ENTROPY_REG_LAMBDA", 0.01)) * entropy_reg
-    )
+    if balance_coefficients is None:
+        balance_coefficients = (
+            float(_cfg("MOE_BALANCE_USAGE_LAMBDA", 1.0)),
+            float(_cfg("MOE_BALANCE_PROB_LAMBDA", 0.5)),
+            float(_cfg("MOE_ENTROPY_REG_LAMBDA", 0.01)),
+        )
+    usage, probability, entropy_weight = balance_coefficients
+    return usage * sparse_balance + probability * prob_balance + entropy_weight * entropy_reg
 
 
 def _topk_sparse_weights(
@@ -72,7 +76,7 @@ def _topk_sparse_weights(
     top_k: int,
     temperature: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build reference-style Top-K sparse weights from gate logits."""
+
     scaled_logits = logits / max(float(temperature), 1.0e-6)
     topk_values, topk_indices = torch.topk(scaled_logits, k=top_k, dim=-1)
     topk_weights = torch.softmax(topk_values, dim=-1)
@@ -82,7 +86,7 @@ def _topk_sparse_weights(
 
 
 class ReliabilityAwareRouter(nn.Module):
-    """Route samples across IPOHGN experts."""
+
 
     def __init__(
         self,
@@ -207,7 +211,7 @@ class ReliabilityAwareRouter(nn.Module):
 
 
 class MTAMHG(nn.Module):
-    """The paper model: four IPOHGN experts with reliability-aware Top-2 routing."""
+    """four IPOHGN experts with reliability-aware Top-2 routing."""
 
     def __init__(
         self,
@@ -265,6 +269,17 @@ class MTAMHG(nn.Module):
             reliability_routing_lambda=float(_cfg("AGENT_RELIABILITY_ROUTING_LAMBDA", 1.0)),
         )
         self.aux_lambda = _moe_aux_lambda()
+        self.balance_coefficients = (
+            float(_cfg("MOE_BALANCE_USAGE_LAMBDA", 1.0)),
+            float(_cfg("MOE_BALANCE_PROB_LAMBDA", 0.5)),
+            float(_cfg("MOE_ENTROPY_REG_LAMBDA", 0.01)),
+        )
+
+        off_diagonal = [i * self.num_experts + j
+                        for i in range(self.num_experts)
+                        for j in range(self.num_experts) if i != j]
+        self.register_buffer("_diversity_indices", torch.tensor(off_diagonal, dtype=torch.long),
+                             persistent=False)
         self.node_names = self.experts[0].node_names
         self.input_node_names = self.experts[0].input_node_names
 
@@ -282,16 +297,19 @@ class MTAMHG(nn.Module):
                 masks[expert_idx, :] = 1.0
         return masks
 
+    def _forward_experts(self, x: torch.Tensor) -> list[dict[str, torch.Tensor]]:
+
+        return [expert(x) for expert in self.experts]
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor] | dict[str, object]]:
-        expert_outputs = [expert(x) for expert in self.experts]
+        expert_outputs = self._forward_experts(x)
         expert_preds = torch.stack([out["mu"] for out in expert_outputs], dim=1)
         expert_hidden = torch.stack([out["hidden"] for out in expert_outputs], dim=1)
         expert_A_kg = torch.stack([out["A_kg"] for out in expert_outputs], dim=0)
         expert_A0 = torch.stack([out["A0"] for out in expert_outputs], dim=0)
         hidden_norm = F.normalize(expert_hidden, dim=-1)
         similarity = torch.matmul(hidden_norm, hidden_norm.transpose(1, 2))
-        eye = torch.eye(self.num_experts, device=x.device, dtype=torch.bool).unsqueeze(0)
-        off_diag_similarity = similarity.masked_select(~eye)
+        off_diag_similarity = similarity.flatten(1).index_select(1, self._diversity_indices)
         diversity_loss = (
             off_diag_similarity.pow(2).mean()
             if off_diag_similarity.numel()
@@ -303,8 +321,9 @@ class MTAMHG(nn.Module):
         expert_weights = gate_out["expert_weights"].to(dtype=expert_preds.dtype)
         y_pred = (expert_preds * expert_weights.unsqueeze(-1)).sum(dim=1)
 
-        aux_loss = router_load_balance_loss(expert_weights, gate_out["gate_probs"])
+        aux_loss = router_load_balance_loss(expert_weights, gate_out["gate_probs"], self.balance_coefficients)
         expert_weight_forward = expert_weights.detach()
+        expert_usage = expert_weight_forward.mean(dim=0).detach()
         debug: dict[str, object] = {
             "model": "mtam_hg",
             "expert_names": self.expert_names,
@@ -312,9 +331,9 @@ class MTAMHG(nn.Module):
             "top_k": self.top_k,
             "num_experts": self.num_experts,
             "aux_lambda": self.aux_lambda,
-            "expert_usage": expert_weight_forward.mean(dim=0).detach(),
+            "expert_usage": expert_usage,
             "expert_selected_rate": (expert_weight_forward > 0).float().mean(dim=0).detach(),
-            "expert_weight_mean": expert_weight_forward.mean(dim=0).detach(),
+            "expert_weight_mean": expert_usage,
         }
         if "sample_confidence" in gate_out:
             debug["sample_confidence_mean"] = gate_out["sample_confidence"].detach().mean()

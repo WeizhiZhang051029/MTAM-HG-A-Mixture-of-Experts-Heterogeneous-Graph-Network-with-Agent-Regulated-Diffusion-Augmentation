@@ -1,13 +1,13 @@
-﻿"""Train MTAM-HG with Agent-governed TabDiff samples."""
+"""Training-feedback regulation and weighted synthetic pretraining."""
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Callable
 
+from training.batch_metadata import transfer_float_metadata
 import numpy as np
 import pandas as pd
 import torch
@@ -27,64 +27,26 @@ from train import (
     checkpoint_payload,
     count_total_parameters,
     count_trainable_parameters,
-    load_checkpoint,
+    restore_model_checkpoint,
     resolve_device,
     save_split_artifacts,
     supervised_finetune,
 )
 from training.clusters import WorkingConditionCluster
+from training.compilation import compiled_pretraining
+
+from training.synthetic_types import SyntheticBundle, TrainTensorBundle, DynamicSyntheticState
+from training.quality_agent import (
+    SyntheticQualityAgent, AGENT_FEEDBACK_FEATURE_NAMES,
+    PAPER_CBTG_METRIC_NAMES, PAPER_CBTG_STATE_COMPONENTS,
+)
+from training.evaluation import feedback_batch_size, score_synthetic_candidates
+from training.step_logging import agent_step_logs, synthetic_step_logs
 from utils.logger import append_csv, ensure_dirs
 from utils.seed import set_seed
+from utils.tensor_logging import scalar_logs
 
 
-@dataclass
-class SyntheticBundle:
-    loader: DataLoader
-    frame: pd.DataFrame
-    y_raw: np.ndarray
-    is_tail: np.ndarray
-    synthetic_source: np.ndarray
-    generation_condition: np.ndarray
-    process_consistency: np.ndarray
-    range_score: np.ndarray
-    manifold_score: np.ndarray
-    label_consistency_score: np.ndarray
-    mechanism_consistency: np.ndarray
-    nearest_train_distance: np.ndarray
-    nearest_train_index: np.ndarray
-    nearest_train_y_raw: np.ndarray
-    synthetic_sha256: str = ""
-    provenance_sha256: str = ""
-
-
-@dataclass
-class TrainTensorBundle:
-    x: torch.Tensor
-    y: torch.Tensor
-    y_raw: torch.Tensor
-
-
-@dataclass
-class DynamicSyntheticState:
-    weights: np.ndarray
-    selected_indices: np.ndarray
-    selected_mask: np.ndarray
-    previous_raw_weights: np.ndarray
-    scarcity_bonus: np.ndarray
-    bin_ids: np.ndarray
-    bin_edges: np.ndarray
-    train_bin_counts: np.ndarray
-    feedback_features: np.ndarray
-    feedback_target: np.ndarray
-    previous_train_score: float | None = None
-    previous_bin_scores: np.ndarray | None = None
-    refresh_count: int = 0
-    cluster_ids: np.ndarray | None = None
-    previous_cluster_rmse: np.ndarray | None = None
-    feedback_history: list[np.ndarray] = field(default_factory=list)
-
-
-PAPER_CBTG_METRIC_NAMES = ("RMSE", "MAE", "MAPE", "ONE_MINUS_R2")
 PAPER_CBTG_METRIC_WEIGHTS = np.asarray((1.0, 0.3, 0.1, 0.3), dtype=np.float64)
 PAPER_CBTG_LAMBDA_S = 0.1
 PAPER_CBTG_LAMBDA_C = 0.3
@@ -95,117 +57,12 @@ PAPER_CBTG_LAMBDA_M = 0.01
 PAPER_CBTG_LAMBDA_H = 0.001
 PAPER_CBTG_TARGET_CONFIDENCE = 0.6
 
-PAPER_CBTG_STATE_COMPONENTS = (
-    "overall_mean",
-    "run_std",
-    "cluster_value",
-    "cluster_variance",
-)
-AGENT_FEEDBACK_FEATURE_NAMES = tuple(
-    f"{metric.lower()}_{component}"
-    for metric in PAPER_CBTG_METRIC_NAMES
-    for component in PAPER_CBTG_STATE_COMPONENTS
-)
-
-
 def _validated_feedback_std(values: np.ndarray | list[float]) -> np.ndarray:
     std = np.asarray(values, dtype=np.float64).reshape(-1)
     expected = (len(PAPER_CBTG_METRIC_NAMES),)
     if std.shape != expected or not np.isfinite(std).all() or np.any(std < 0.0):
         raise ValueError(f"feedback_std must contain {expected[0]} finite non-negative values.")
     return std
-
-
-class SyntheticQualityAgent(nn.Module):
-    """Score synthetic samples from process and model feedback."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 128,
-        dropout: float = 0.1,
-        feedback_dim: int = len(AGENT_FEEDBACK_FEATURE_NAMES),
-        attention_dim: int = 64,
-        attention_heads: int = 4,
-    ) -> None:
-        super().__init__()
-        self.base_input_dim = int(input_dim)
-        self.feedback_dim = int(feedback_dim)
-        hidden_dim = int(hidden_dim)
-        self.attention_dim = int(attention_dim)
-        self.attention_heads = int(attention_heads)
-        if self.attention_dim <= 0:
-            raise ValueError("attention_dim must be positive.")
-        if self.attention_heads <= 0:
-            raise ValueError("attention_heads must be positive.")
-        if self.attention_dim % self.attention_heads != 0:
-            raise ValueError("attention_dim must be divisible by attention_heads.")
-        self.sample_query = nn.Sequential(
-            nn.Linear(self.base_input_dim, self.attention_dim),
-            nn.LayerNorm(self.attention_dim),
-            nn.GELU(),
-        )
-        self.feedback_value = nn.Linear(1, self.attention_dim)
-        self.feedback_type_embedding = nn.Parameter(torch.zeros(self.feedback_dim, self.attention_dim))
-        self.feedback_norm = nn.LayerNorm(self.attention_dim)
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=self.attention_dim,
-            num_heads=self.attention_heads,
-            dropout=float(dropout),
-            batch_first=True,
-        )
-        self.attention_dropout = nn.Dropout(float(dropout))
-        head_input_dim = self.base_input_dim + self.feedback_dim + 2 * self.attention_dim
-        self.net = nn.Sequential(
-            nn.Linear(head_input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        y_generated: torch.Tensor,
-        feedback_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        batch_size = x.shape[0]
-        if feedback_features is None:
-            feedback = x.new_zeros((batch_size, self.feedback_dim))
-        else:
-            feedback = feedback_features.to(device=x.device, dtype=x.dtype).reshape(batch_size, -1)
-            if feedback.shape[1] != self.feedback_dim:
-                raise ValueError(
-                    f"Agent feedback feature dim {feedback.shape[1]} does not match expected {self.feedback_dim}."
-                )
-        sample_features = torch.cat(
-            [x.reshape(batch_size, -1), y_generated.reshape(batch_size, -1)],
-            dim=-1,
-        )
-        if sample_features.shape[1] != self.base_input_dim:
-            raise ValueError(
-                f"Agent sample feature dim {sample_features.shape[1]} does not match expected {self.base_input_dim}."
-            )
-        query = self.sample_query(sample_features).unsqueeze(1)
-        feedback_tokens = self.feedback_value(feedback.unsqueeze(-1))
-        feedback_tokens = self.feedback_norm(feedback_tokens + self.feedback_type_embedding.unsqueeze(0))
-        attended, _ = self.cross_attention(query, feedback_tokens, feedback_tokens, need_weights=False)
-        attended = self.attention_dropout(attended.squeeze(1))
-        features = torch.cat(
-            [
-                sample_features,
-                feedback,
-                query.squeeze(1),
-                attended,
-            ],
-            dim=-1,
-        )
-        return self.net(features)
 
 
 def build_synthetic_quality_agent(data_bundle: DataBundle, device: torch.device) -> SyntheticQualityAgent:
@@ -220,7 +77,7 @@ def build_synthetic_quality_agent(data_bundle: DataBundle, device: torch.device)
 
 
 def synthetic_agent_reward_from_real_mse(mse_real: torch.Tensor | float) -> torch.Tensor | float:
-    """Real-error reward component: reward_mse = 1 / (1 + MSE_real)."""
+
     if torch.is_tensor(mse_real):
         return 1.0 / (1.0 + mse_real)
     return 1.0 / (1.0 + float(mse_real))
@@ -246,7 +103,7 @@ def synthetic_agent_reward_components(
     process_consistency: torch.Tensor | np.ndarray | float,
     mechanism_consistency: torch.Tensor | np.ndarray | float,
 ) -> dict[str, torch.Tensor | np.ndarray | float]:
-    """Blend train-only real-error, distribution, and mechanism consistency rewards."""
+
     mse_reward = synthetic_agent_reward_from_real_mse(mse_real)
     w_mse, w_process, w_mechanism = _synthetic_reward_weights()
     if torch.is_tensor(mse_reward):
@@ -280,7 +137,7 @@ def select_synthetic_by_quality_score(
     quality_score: np.ndarray | torch.Tensor,
     threshold: float | None = None,
 ) -> np.ndarray | torch.Tensor:
-    """Return the synthetic-pretrain confidence mask for the current batch."""
+
     threshold = float(getattr(config, "SYNTHETIC_CONFIDENCE_THRESHOLD", 0.5) if threshold is None else threshold)
     if torch.is_tensor(quality_score):
         return quality_score.reshape(-1) > threshold
@@ -365,7 +222,7 @@ def _real_mse_reward_for_indices(
     nearest_train_index: np.ndarray,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Evaluate train-only real-label MSE for synthetic samples' nearest regions."""
+
     idx_np = _normalize_indices(nearest_train_index, train_tensors.x.shape[0])
     idx = torch.tensor(idx_np, dtype=torch.long, device=device)
     outputs = model(train_tensors.x.index_select(0, idx))
@@ -379,61 +236,59 @@ def _real_mse_reward_for_indices(
     return mse_real.detach(), reward.detach(), y_pred.detach(), y_true.detach()
 
 
-def _pairwise_min_distance(
-    query: np.ndarray,
-    reference: np.ndarray,
-    chunk_size: int = 1024,
-) -> tuple[np.ndarray, np.ndarray]:
+def _squared_distance_chunks(query, reference, chunk_size):
+
     if len(reference) == 0:
         raise ValueError("Reference array is empty.")
-    distances: list[np.ndarray] = []
-    indices: list[np.ndarray] = []
     ref = reference.astype(np.float32, copy=False)
     for start in range(0, len(query), chunk_size):
         q = query[start:start + chunk_size].astype(np.float32, copy=False)
         diff = q[:, None, :] - ref[None, :, :]
-        dist = np.sqrt(np.maximum(np.sum(diff * diff, axis=-1), 0.0))
-        idx = np.argmin(dist, axis=1)
-        distances.append(dist[np.arange(len(q)), idx])
-        indices.append(idx.astype(np.int64))
-    return np.concatenate(distances).astype(np.float32), np.concatenate(indices).astype(np.int64)
+        yield start, np.sum(diff * diff, axis=-1)
 
 
-def _knn_label_mean(
-    query: np.ndarray,
-    reference: np.ndarray,
-    y_reference: np.ndarray,
-    k: int,
-    chunk_size: int = 1024,
-) -> np.ndarray:
-    if len(reference) == 0:
-        raise ValueError("Reference array is empty.")
-    k = max(1, min(int(k), len(reference)))
-    means: list[np.ndarray] = []
-    ref = reference.astype(np.float32, copy=False)
-    y_ref = y_reference.reshape(-1).astype(np.float32, copy=False)
-    for start in range(0, len(query), chunk_size):
-        q = query[start:start + chunk_size].astype(np.float32, copy=False)
-        diff = q[:, None, :] - ref[None, :, :]
-        dist_sq = np.sum(diff * diff, axis=-1)
-        if k == len(reference):
-            idx = np.argsort(dist_sq, axis=1)[:, :k]
-        else:
-            idx = np.argpartition(dist_sq, kth=k - 1, axis=1)[:, :k]
-        means.append(y_ref[idx].mean(axis=1))
-    return np.concatenate(means).reshape(-1, 1).astype(np.float32)
+def _neighbor_statistics(query, reference, y_reference=None, k=1, chunk_size=1024, *, nearest=True):
+
+    distances, indices, means = [], [], []
+    if y_reference is not None:
+        k = max(1, min(int(k), len(reference)))
+        y_ref = y_reference.reshape(-1).astype(np.float32, copy=False)
+    for _, dist_sq in _squared_distance_chunks(query, reference, chunk_size):
+        if nearest:
+
+            dist = np.sqrt(np.maximum(dist_sq, 0.0))
+            idx = np.argmin(dist, axis=1)
+            distances.append(dist[np.arange(len(dist)), idx])
+            indices.append(idx.astype(np.int64))
+        if y_reference is not None:
+            neighbors = (np.argsort(dist_sq, axis=1)[:, :k] if k == len(reference)
+                         else np.argpartition(dist_sq, kth=k - 1, axis=1)[:, :k])
+            means.append(y_ref[neighbors].mean(axis=1))
+    return (
+        np.concatenate(distances).astype(np.float32) if nearest else None,
+        np.concatenate(indices).astype(np.int64) if nearest else None,
+        np.concatenate(means).reshape(-1, 1).astype(np.float32) if y_reference is not None else None,
+    )
+
+
+def _pairwise_min_distance(query, reference, chunk_size=1024):
+    distance, index, _ = _neighbor_statistics(query, reference, chunk_size=chunk_size)
+    return distance, index
+
+
+def _knn_label_mean(query, reference, y_reference, k, chunk_size=1024):
+    return _neighbor_statistics(
+        query, reference, y_reference, k, chunk_size, nearest=False,
+    )[2]
 
 
 def _leave_one_out_distance(reference: np.ndarray, chunk_size: int = 1024) -> np.ndarray:
     if len(reference) <= 1:
         return np.ones(len(reference), dtype=np.float32)
     distances: list[np.ndarray] = []
-    ref = reference.astype(np.float32, copy=False)
-    for start in range(0, len(reference), chunk_size):
-        q = ref[start:start + chunk_size]
-        diff = q[:, None, :] - ref[None, :, :]
-        dist = np.sqrt(np.maximum(np.sum(diff * diff, axis=-1), 0.0))
-        rows = np.arange(len(q))
+    for start, dist_sq in _squared_distance_chunks(reference, reference, chunk_size):
+        dist = np.sqrt(np.maximum(dist_sq, 0.0))
+        rows = np.arange(len(dist))
         dist[rows, start + rows] = np.inf
         distances.append(np.min(dist, axis=1))
     return np.concatenate(distances).astype(np.float32)
@@ -446,7 +301,7 @@ def compute_process_consistency_scores(
     x_raw: np.ndarray,
     y_raw: np.ndarray,
 ) -> dict[str, np.ndarray]:
-    """Score synthetic samples against train-only process distribution constraints."""
+
     train_x_scaled, train_y_scaled, train_x_raw, train_y_raw = _train_arrays(data_bundle)
     low_q = float(getattr(config, "SYNTHETIC_PROCESS_RANGE_QUANTILE_LOW", 0.01))
     high_q = float(getattr(config, "SYNTHETIC_PROCESS_RANGE_QUANTILE_HIGH", 0.99))
@@ -463,15 +318,16 @@ def compute_process_consistency_scores(
     excess = (below + above) / spread.reshape(1, -1)
     range_score = np.exp(-excess).mean(axis=1)
 
-    nearest_distance, nearest_index = _pairwise_min_distance(x_scaled, train_x_scaled)
+    k = int(getattr(config, "SYNTHETIC_PROCESS_KNN_K", 5))
+    nearest_distance, nearest_index, knn_y_scaled = _neighbor_statistics(
+        x_scaled, train_x_scaled, train_y_scaled, k=k,
+    )
     train_nn = _leave_one_out_distance(train_x_scaled)
     distance_scale = float(np.nanquantile(train_nn, 0.95)) if len(train_nn) else 1.0
     if not np.isfinite(distance_scale) or distance_scale < 1.0e-6:
         distance_scale = float(np.nanmedian(train_nn[train_nn > 0])) if np.any(train_nn > 0) else 1.0
     manifold_score = np.exp(-((nearest_distance / max(distance_scale, 1.0e-6)) ** 2))
 
-    k = int(getattr(config, "SYNTHETIC_PROCESS_KNN_K", 5))
-    knn_y_scaled = _knn_label_mean(x_scaled, train_x_scaled, train_y_scaled, k=k)
     y_scale = float(np.nanstd(train_y_scaled))
     if not np.isfinite(y_scale) or y_scale < 1.0e-6:
         y_scale = 1.0
@@ -509,7 +365,7 @@ def compute_mechanism_consistency_scores(
     data_bundle: DataBundle,
     x_raw: np.ndarray,
 ) -> np.ndarray:
-    """Score synthetic samples against train-only metallurgical mechanism groups."""
+
     _, _, train_x_raw, _ = _train_arrays(data_bundle)
     feature_to_idx = {name: idx for idx, name in enumerate(data_bundle.standard_node_names)}
     group_scores: list[np.ndarray] = []
@@ -542,7 +398,7 @@ def _agent_synthetic_weight(
     mechanism_consistency: torch.Tensor,
     synthetic_keep_score: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Combine Agent confidence with process and metallurgical mechanism consistency."""
+
     weight = confidence.reshape(-1).clamp(0.0, 1.0)
     if synthetic_keep_score is not None:
         governance = synthetic_keep_score.reshape(-1).clamp(0.0, 1.0)
@@ -704,7 +560,7 @@ def synthetic_scarcity_bonus(
     reference_y: np.ndarray,
     n_bins: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return train-label scarcity bonuses for synthetic rows using train-only labels."""
+
     bins = int(n_bins or getattr(config, "DYNAMIC_SYNTHETIC_SCARCITY_BINS", 10))
     bin_ids, edges, counts = _synthetic_equal_width_bins(y_values, reference_y, bins)
     nonzero = counts[counts > 0]
@@ -765,7 +621,7 @@ def _paper_oriented_metrics(
     y_pred: np.ndarray,
     tail_thresholds: tuple[float, float],
 ) -> np.ndarray:
-    """Return the four paper metrics with a common lower-is-better direction."""
+
     values = compute_metrics(
         np.asarray(y_true, dtype=np.float64).reshape(-1, 1),
         np.asarray(y_pred, dtype=np.float64).reshape(-1, 1),
@@ -783,7 +639,7 @@ def _paper_oriented_metrics(
 
 
 def _zscore_across_metrics(values: np.ndarray) -> np.ndarray:
-    """Standardize one state component so the four metrics are comparable."""
+
     array = np.asarray(values, dtype=np.float64)
     finite = np.isfinite(array)
     count = finite.sum(axis=-1, keepdims=True)
@@ -867,17 +723,17 @@ def evaluate_training_feedback(
     feedback_history: list[np.ndarray],
     cluster_model: WorkingConditionCluster | None = None,
 ) -> dict[str, np.ndarray | float]:
-    """Evaluate real training rows and accumulate feedback-history variation."""
+
     model_was_training = model.training
     model.eval()
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
     preds: list[np.ndarray] = []
-    for batch in DataLoader(data_bundle.train_loader.dataset, batch_size=config.BATCH_SIZE, shuffle=False):
+    for batch in DataLoader(data_bundle.train_loader.dataset, batch_size=feedback_batch_size(config.BATCH_SIZE), shuffle=False):
         x, y = batch[0].to(device), batch[1].to(device)
         outputs = model(x)
-        xs.append(x.detach().cpu().numpy())
-        ys.append(y.detach().cpu().numpy())
+        xs.append(batch[0].detach().cpu().numpy())
+        ys.append(batch[1].detach().cpu().numpy())
         preds.append(_output_mu(outputs).detach().cpu().numpy())
     if not ys:
         raise ValueError("CBTG-Agent requires a non-empty training loader.")
@@ -932,7 +788,7 @@ def agent_policy_quota_multiplier(
     agent_policy_score: np.ndarray,
     reliability: np.ndarray,
 ) -> np.ndarray:
-    """Allocate expected synthetic draws from the feedback-conditioned Agent output."""
+
     mapped = _unit_interval(agent_policy_score, neutral=0.5)
     strength = max(0.0, float(getattr(config, "DYNAMIC_SYNTHETIC_QUOTA_STRENGTH", 0.50)))
     quota_min = max(0.0, float(getattr(config, "DYNAMIC_SYNTHETIC_QUOTA_MIN", 0.50)))
@@ -1049,7 +905,7 @@ def select_top_synthetic_indices(
     score: np.ndarray,
     top_ratio: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return stable top-ratio indices and a boolean keep mask for synthetic rows."""
+
     scores = np.asarray(score, dtype=np.float64).reshape(-1)
     n = len(scores)
     if n == 0:
@@ -1083,19 +939,13 @@ def rebuild_synthetic_loader(
             )
             dynamic_state.selected_indices = selected
             dynamic_state.selected_mask = selected_mask
-        synthetic_bundle.loader = DataLoader(
-            Subset(base_dataset, selected.tolist()),
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=config.NUM_WORKERS,
-        )
-    else:
-        synthetic_bundle.loader = DataLoader(
-            base_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=config.NUM_WORKERS,
-        )
+        base_dataset = Subset(base_dataset, selected.tolist())
+    synthetic_bundle.loader = DataLoader(
+        base_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+    )
     return synthetic_bundle.loader
 
 
@@ -1109,6 +959,80 @@ def _train_score_from_metrics(metrics: dict[str, float]) -> float:
     if metric == "mae":
         return float(metrics.get("MAE", rmse))
     return rmse
+
+
+def _feedback_for_clusters(training_feedback, cluster_ids):
+
+    return build_paper_cbtg_feedback(
+        np.asarray(training_feedback["overall_metrics"], dtype=np.float64),
+        np.asarray(training_feedback["run_std"], dtype=np.float64),
+        np.asarray(training_feedback["per_cluster_metrics"], dtype=np.float64),
+        cluster_ids,
+    )
+
+
+def _refresh_diagnostic_errors(model, train_tensors, synthetic_bundle, eval_loader, device):
+
+    n = len(synthetic_bundle.frame)
+    synthetic_mse = np.zeros(n, dtype=np.float64)
+    train_region_mse = np.zeros(n, dtype=np.float64)
+
+    if not getattr(config, "FAST_SKIP_REFRESH_DIAGNOSTICS", False):
+        with torch.no_grad():
+            for x, y, sample_ids in eval_loader:
+                x = x.to(device)
+                y = y.to(device)
+                sample_ids_np = sample_ids.detach().cpu().numpy().reshape(-1)
+                outputs = model(x)
+                y_pred = _output_mu(outputs).reshape(y.shape[0], -1)
+                y_true = y.reshape(y.shape[0], -1)
+                synthetic_batch_mse = ((y_pred - y_true) ** 2).mean(dim=-1)
+                mse_real, _, _, _ = _real_mse_reward_for_indices(
+                    model,
+                    train_tensors,
+                    synthetic_bundle.nearest_train_index[sample_ids_np],
+                    device,
+                )
+                synthetic_mse[sample_ids_np] = synthetic_batch_mse.detach().cpu().numpy().reshape(-1)
+                train_region_mse[sample_ids_np] = mse_real.detach().cpu().numpy().reshape(-1)
+
+    else:
+        synthetic_mse.fill(np.nan)
+        train_region_mse.fill(np.nan)
+
+    return synthetic_mse, train_region_mse
+
+
+def _update_refresh_agent(quality_agent, eval_loader, dynamic_state, optimizer, device):
+
+    refresh_agent_losses: list[float] = []
+    if optimizer is not None:
+        quality_agent.train()
+        agent_parameters = tuple(quality_agent.parameters())
+        for x, y, sample_ids in eval_loader:
+            x = x.to(device)
+            y = y.to(device)
+            sample_ids_np = sample_ids.detach().cpu().numpy().reshape(-1)
+            feedback_batch = torch.tensor(
+                dynamic_state.feedback_features[sample_ids_np],
+                dtype=x.dtype,
+                device=device,
+            )
+            reward_batch = torch.tensor(
+                dynamic_state.feedback_target[sample_ids_np],
+                dtype=y.dtype,
+                device=device,
+            )
+            policy_batch = quality_agent(x, y, feedback_batch).reshape(-1)
+            refresh_agent_loss, _ = paper_cbtg_agent_loss(policy_batch, reward_batch)
+            optimizer.zero_grad(set_to_none=True)
+            refresh_agent_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent_parameters, config.GRAD_CLIP_NORM, foreach=True)
+            optimizer.step()
+            refresh_agent_losses.append(float(refresh_agent_loss.detach().cpu()))
+        quality_agent.eval()
+
+    return refresh_agent_losses
 
 
 def refresh_dynamic_synthetic_weights(
@@ -1129,9 +1053,6 @@ def refresh_dynamic_synthetic_weights(
     model.eval()
     quality_agent.eval()
     n = len(synthetic_bundle.frame)
-    agent_policy = np.ones(n, dtype=np.float64)
-    synthetic_mse = np.zeros(n, dtype=np.float64)
-    train_region_mse = np.zeros(n, dtype=np.float64)
     base_dataset = synthetic_bundle.loader.dataset
     while isinstance(base_dataset, Subset):
         base_dataset = base_dataset.dataset
@@ -1141,23 +1062,9 @@ def refresh_dynamic_synthetic_weights(
         shuffle=False,
         num_workers=config.NUM_WORKERS,
     )
-    with torch.no_grad():
-        for x, y, sample_ids in eval_loader:
-            x = x.to(device)
-            y = y.to(device)
-            sample_ids_np = sample_ids.detach().cpu().numpy().reshape(-1)
-            outputs = model(x)
-            y_pred = _output_mu(outputs).reshape(y.shape[0], -1)
-            y_true = y.reshape(y.shape[0], -1)
-            synthetic_batch_mse = ((y_pred - y_true) ** 2).mean(dim=-1)
-            mse_real, _, _, _ = _real_mse_reward_for_indices(
-                model,
-                train_tensors,
-                synthetic_bundle.nearest_train_index[sample_ids_np],
-                device,
-            )
-            synthetic_mse[sample_ids_np] = synthetic_batch_mse.detach().cpu().numpy().reshape(-1)
-            train_region_mse[sample_ids_np] = mse_real.detach().cpu().numpy().reshape(-1)
+    synthetic_mse, train_region_mse = _refresh_diagnostic_errors(
+        model, train_tensors, synthetic_bundle, eval_loader, device,
+    )
 
     training_feedback = evaluate_training_feedback(
         model,
@@ -1171,53 +1078,20 @@ def refresh_dynamic_synthetic_weights(
         if dynamic_state.cluster_ids is not None
         else np.zeros(n, dtype=np.int64)
     )
-    feedback_parts = build_paper_cbtg_feedback(
-        np.asarray(training_feedback["overall_metrics"], dtype=np.float64),
-        np.asarray(training_feedback["run_std"], dtype=np.float64),
-        np.asarray(training_feedback["per_cluster_metrics"], dtype=np.float64),
-        sample_cluster_ids,
-    )
+    feedback_parts = _feedback_for_clusters(training_feedback, sample_cluster_ids)
     dynamic_state.feedback_features = feedback_parts["features"].astype(np.float64)
     dynamic_state.feedback_target = feedback_parts["target"].astype(np.float64)
 
-    refresh_agent_losses: list[float] = []
-    if optimizer is not None:
-        quality_agent.train()
-        for x, y, sample_ids in eval_loader:
-            x = x.to(device)
-            y = y.to(device)
-            sample_ids_np = sample_ids.detach().cpu().numpy().reshape(-1)
-            feedback_batch = torch.tensor(
-                dynamic_state.feedback_features[sample_ids_np],
-                dtype=x.dtype,
-                device=device,
-            )
-            reward_batch = torch.tensor(
-                dynamic_state.feedback_target[sample_ids_np],
-                dtype=y.dtype,
-                device=device,
-            )
-            policy_batch = quality_agent(x, y, feedback_batch).reshape(-1)
-            refresh_agent_loss, _ = paper_cbtg_agent_loss(policy_batch, reward_batch)
-            optimizer.zero_grad(set_to_none=True)
-            refresh_agent_loss.backward()
-            torch.nn.utils.clip_grad_norm_(quality_agent.parameters(), config.GRAD_CLIP_NORM)
-            optimizer.step()
-            refresh_agent_losses.append(float(refresh_agent_loss.detach().cpu()))
-        quality_agent.eval()
+    refresh_agent_losses = _update_refresh_agent(
+        quality_agent, eval_loader, dynamic_state, optimizer, device,
+    )
 
-    with torch.no_grad():
-        for x, y, sample_ids in eval_loader:
-            x = x.to(device)
-            y = y.to(device)
-            sample_ids_np = sample_ids.detach().cpu().numpy().reshape(-1)
-            feedback_batch = torch.tensor(
-                dynamic_state.feedback_features[sample_ids_np],
-                dtype=x.dtype,
-                device=device,
-            )
-            policy_batch = quality_agent(x, y, feedback_batch).reshape(-1).clamp(0.0, 1.0)
-            agent_policy[sample_ids_np] = policy_batch.detach().cpu().numpy().reshape(-1)
+    agent_policy = score_synthetic_candidates(
+        quality_agent, base_dataset, dynamic_state.feedback_features, device,
+        sample_count=n,
+        batch_size=feedback_batch_size(int(getattr(config, "SYNTHETIC_BATCH_SIZE", config.BATCH_SIZE))),
+        num_workers=config.NUM_WORKERS,
+    )
 
     weight_parts = compute_dynamic_synthetic_weights(
         current_weights=dynamic_state.weights,
@@ -1293,6 +1167,7 @@ def refresh_dynamic_synthetic_weights(
     if agent_was_training:
         quality_agent.train()
     return {
+        "dynamic_refresh_diagnostics_skipped": float(getattr(config, "FAST_SKIP_REFRESH_DIAGNOSTICS", False)),
         "dynamic_refresh_epoch": float(epoch),
         "dynamic_refresh_count": float(dynamic_state.refresh_count),
         "dynamic_weight_mean": float(np.mean(dynamic_state.weights)) if n else float("nan"),
@@ -1342,7 +1217,7 @@ def paper_cbtg_agent_loss(
     confidence: torch.Tensor,
     reward: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Exact contextual-bandit objective in the paper's Eq. (9)."""
+    """Contextual-bandit policy objective."""
     c = confidence.reshape(-1).clamp(1.0e-6, 1.0 - 1.0e-6)
     r = reward.detach().reshape_as(c).clamp(PAPER_CBTG_REWARD_MIN, PAPER_CBTG_REWARD_MAX)
     expected_reward_loss = -(c * r).mean()
@@ -1373,50 +1248,60 @@ def _synthetic_step(
     device: torch.device,
     dynamic_state: DynamicSyntheticState | None = None,
     update_quality_agent: bool = True,
+    *,
+    clip_parameters: tuple[tuple[torch.nn.Parameter, ...], tuple[torch.nn.Parameter, ...]] | None = None,
 ) -> dict[str, float]:
     x, y, sample_ids = batch
     x = x.to(device)
     y = y.to(device)
     sample_ids_np = sample_ids.detach().cpu().numpy().reshape(-1)
-    is_tail = torch.tensor(synthetic_bundle.is_tail[sample_ids_np], dtype=y.dtype, device=device)
+    metadata_values = {
+        "is_tail": synthetic_bundle.is_tail[sample_ids_np],
+        "process": synthetic_bundle.process_consistency[sample_ids_np],
+        "mechanism": synthetic_bundle.mechanism_consistency[sample_ids_np],
+    }
+    if dynamic_state is not None:
+        metadata_values["reward"] = dynamic_state.feedback_target[sample_ids_np]
+        if bool(getattr(config, "DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT", True)):
+            metadata_values["weight"] = dynamic_state.weights[sample_ids_np]
+        if x.dtype == y.dtype:
+            metadata_values["feedback"] = dynamic_state.feedback_features[sample_ids_np]
+    metadata = transfer_float_metadata(metadata_values, dtype=y.dtype, device=device)
+    is_tail = metadata["is_tail"]
     outputs = model(x)
     if torch.is_tensor(outputs):
         outputs = {"mu": outputs}
     feedback_batch = None
     feedback_reward = None
     if dynamic_state is not None:
-        feedback_batch = torch.tensor(
-            dynamic_state.feedback_features[sample_ids_np],
-            dtype=x.dtype,
-            device=device,
+        feedback_batch = (
+            metadata["feedback"] if x.dtype == y.dtype else
+            torch.tensor(dynamic_state.feedback_features[sample_ids_np],
+                         dtype=x.dtype, device=device)
         )
-        feedback_reward = torch.tensor(
-            dynamic_state.feedback_target[sample_ids_np],
-            dtype=y.dtype,
-            device=device,
-        ).reshape(-1)
+        feedback_reward = metadata["reward"].reshape(-1)
     if update_quality_agent:
         quality_score = quality_agent(x, y, feedback_batch).reshape(-1).clamp(1.0e-6, 1.0 - 1.0e-6)
     else:
         with torch.no_grad():
             quality_score = quality_agent(x, y, feedback_batch).reshape(-1).clamp(1.0e-6, 1.0 - 1.0e-6)
-    mse_real, _, _, _ = _real_mse_reward_for_indices(
-        model,
-        train_tensors,
-        synthetic_bundle.nearest_train_index[sample_ids_np],
-        device,
+
+    skip_real_diagnostics = (
+        feedback_reward is not None
+        and getattr(config, "FAST_SKIP_REDUNDANT_REAL_FORWARD", False)
     )
-    mse_real = mse_real.to(device=device, dtype=y.dtype)
-    process_consistency = torch.tensor(
-        synthetic_bundle.process_consistency[sample_ids_np],
-        dtype=y.dtype,
-        device=device,
-    ).clamp(0.0, 1.0)
-    mechanism_consistency = torch.tensor(
-        synthetic_bundle.mechanism_consistency[sample_ids_np],
-        dtype=y.dtype,
-        device=device,
-    ).clamp(0.0, 1.0)
+    if skip_real_diagnostics:
+        mse_real = y.new_full((y.shape[0],), float("nan"))
+    else:
+        mse_real, _, _, _ = _real_mse_reward_for_indices(
+            model,
+            train_tensors,
+            synthetic_bundle.nearest_train_index[sample_ids_np],
+            device,
+        )
+        mse_real = mse_real.to(device=device, dtype=y.dtype)
+    process_consistency = metadata["process"].clamp(0.0, 1.0)
+    mechanism_consistency = metadata["mechanism"].clamp(0.0, 1.0)
     reward_parts = synthetic_agent_reward_components(mse_real, process_consistency, mechanism_consistency)
     fallback_reward = 2.0 * reward_parts["reward"].to(device=device, dtype=y.dtype) - 1.0
     reward = (
@@ -1432,11 +1317,7 @@ def _synthetic_step(
         dynamic_state is not None
         and bool(getattr(config, "DYNAMIC_SYNTHETIC_USE_LOSS_WEIGHT", True))
     ):
-        dynamic_batch_weight = torch.tensor(
-            dynamic_state.weights[sample_ids_np],
-            dtype=y.dtype,
-            device=device,
-        ).reshape(-1, 1)
+        dynamic_batch_weight = metadata["weight"].reshape(-1, 1)
     elif bool(getattr(config, "SYNTHETIC_USE_AGENT_WEIGHT", True)):
         dynamic_batch_weight = final_confidence.detach().reshape(-1, 1)
 
@@ -1448,87 +1329,40 @@ def _synthetic_step(
         y,
         x=x,
         batch_weights=dynamic_batch_weight,
+        include_expert_logs=False,
+        defer_logs=True,
     )
 
     agent_loss = torch.tensor(0.0, device=device)
     agent_logs: dict[str, float] = {}
     if update_quality_agent and bool(getattr(config, "SYNTHETIC_USE_REWARD_LOSS", True)):
         agent_loss, agent_components = paper_cbtg_agent_loss(quality_score, reward)
-        agent_logs = {
-            "agent_reward_loss": float(agent_components["expected_reward_loss"].detach().cpu()),
-            "agent_total_loss": float(agent_loss.detach().cpu()),
-            "agent_confidence_mean_regularizer": float(agent_components["mean_regularizer"].detach().cpu()),
-            "agent_confidence_entropy": float(agent_components["confidence_entropy"].detach().cpu()),
-            "reward_mean": float(reward.detach().mean().cpu()),
-            "reward_std": float(reward.detach().std(unbiased=False).cpu()),
-            "reward_min": float(reward.detach().min().cpu()),
-            "reward_max": float(reward.detach().max().cpu()),
-            "reward_mse_mean": float(reward_parts["reward_mse"].detach().mean().cpu()),
-            "reward_process_mean": float(reward_parts["reward_process"].detach().mean().cpu()),
-            "reward_mechanism_mean": float(reward_parts["reward_mechanism"].detach().mean().cpu()),
-            "reward_feedback_mean": float(feedback_reward.detach().mean().cpu()) if feedback_reward is not None else float("nan"),
-            "mse_real_mean": float(mse_real.detach().mean().cpu()),
-            "mse_real_std": float(mse_real.detach().std(unbiased=False).cpu()),
-        }
+        agent_logs = agent_step_logs(
+            agent_components, agent_loss, reward, reward_parts, feedback_reward, mse_real,
+            defer_logs=True,
+        )
         total = total + float(getattr(config, "AGENT_REWARD_LAMBDA", 0.01)) * agent_loss
 
     optimizer.zero_grad()
     total.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_NORM)
+    torch.nn.utils.clip_grad_norm_(
+        model.parameters() if clip_parameters is None else clip_parameters[0], config.GRAD_CLIP_NORM, foreach=True
+    )
     if update_quality_agent:
-        torch.nn.utils.clip_grad_norm_(quality_agent.parameters(), config.GRAD_CLIP_NORM)
+        torch.nn.utils.clip_grad_norm_(
+            quality_agent.parameters() if clip_parameters is None else clip_parameters[1], config.GRAD_CLIP_NORM, foreach=True
+        )
     optimizer.step()
 
-    gate_probs = outputs.get("gate_probs")
-    entropy = (
-        -(gate_probs.detach() * torch.log(gate_probs.detach() + 1.0e-8)).sum(dim=-1).mean()
-        if gate_probs is not None
-        else torch.tensor(float("nan"), device=device)
+    step_logs = synthetic_step_logs(
+        outputs=outputs, base_loss_logs=base_loss_logs, agent_logs=agent_logs,
+        agent_loss=agent_loss, total=total, quality_score=quality_score,
+        process_consistency=process_consistency, mechanism_consistency=mechanism_consistency,
+        selected=selected, is_tail=is_tail, dynamic_batch_weight=dynamic_batch_weight,
+        update_quality_agent=update_quality_agent, device=device,
     )
-    expert_uncertainty = outputs.get("expert_uncertainty")
-    if expert_uncertainty is None and "expert_preds" in outputs:
-        expert_uncertainty = outputs["expert_preds"].detach().var(dim=1, unbiased=False)
-    reward_mean = agent_logs.get("reward_mean", float("nan"))
-    reward_std = agent_logs.get("reward_std", float("nan"))
-    return {
-        "synthetic_pred_loss": float(base_loss_logs.get("pred_loss", float("nan"))),
-        "synthetic_moe_aux_loss": float(base_loss_logs.get("moe_loss", float("nan"))),
-        "synthetic_expert_calibration_loss": float(base_loss_logs.get("expert_calibration_loss", 0.0)),
-        "synthetic_expert_diversity_loss": float(base_loss_logs.get("expert_diversity_loss", 0.0)),
-        "synthetic_graph_loss": float(base_loss_logs.get("graph_loss", 0.0)),
-        "synthetic_agent_reward_loss": agent_logs.get("agent_reward_loss", float(agent_loss.detach().cpu())),
-        "synthetic_agent_total_loss": agent_logs.get("agent_total_loss", float(agent_loss.detach().cpu())),
-        "synthetic_total_loss": float(total.detach().cpu()),
-        "synthetic_reward_mean": reward_mean,
-        "synthetic_reward_std": reward_std,
-        "synthetic_reward_min": agent_logs.get("reward_min", float("nan")),
-        "synthetic_reward_max": agent_logs.get("reward_max", float("nan")),
-        "synthetic_reward_mse_mean": agent_logs.get("reward_mse_mean", float("nan")),
-        "synthetic_reward_process_mean": agent_logs.get("reward_process_mean", float("nan")),
-        "synthetic_reward_mechanism_mean": agent_logs.get("reward_mechanism_mean", float("nan")),
-        "synthetic_reward_feedback_mean": agent_logs.get("reward_feedback_mean", float("nan")),
-        "synthetic_mse_real_mean": agent_logs.get("mse_real_mean", float("nan")),
-        "synthetic_mse_real_std": agent_logs.get("mse_real_std", float("nan")),
-        "synthetic_confidence_mean": float(quality_score.detach().mean().cpu()),
-        "synthetic_confidence_std": float(quality_score.detach().std(unbiased=False).cpu()),
-        "synthetic_keep_score_mean": float(quality_score.detach().mean().cpu()),
-        "synthetic_keep_score_std": float(quality_score.detach().std(unbiased=False).cpu()),
-        "synthetic_quality_score_mean": float(quality_score.detach().mean().cpu()),
-        "synthetic_quality_score_std": float(quality_score.detach().std(unbiased=False).cpu()),
-        "synthetic_process_consistency_mean": float(process_consistency.detach().mean().cpu()),
-        "synthetic_process_consistency_std": float(process_consistency.detach().std(unbiased=False).cpu()),
-        "synthetic_mechanism_consistency_mean": float(mechanism_consistency.detach().mean().cpu()),
-        "synthetic_mechanism_consistency_std": float(mechanism_consistency.detach().std(unbiased=False).cpu()),
-        "synthetic_final_weight_mean": float(final_confidence.detach().mean().cpu()),
-        "synthetic_final_weight_std": float(final_confidence.detach().std(unbiased=False).cpu()),
-        "synthetic_selected_ratio": float(selected.detach().float().mean().cpu()),
-        "synthetic_tail_ratio": float(is_tail.detach().float().mean().cpu()),
-        "dynamic_synthetic_weight_mean": float(dynamic_batch_weight.detach().mean().cpu()) if dynamic_batch_weight is not None else float("nan"),
-        "dynamic_synthetic_weight_std": float(dynamic_batch_weight.detach().std(unbiased=False).cpu()) if dynamic_batch_weight is not None else float("nan"),
-        "synthetic_expert_uncertainty_mean": float(expert_uncertainty.detach().mean().cpu()) if expert_uncertainty is not None else float("nan"),
-        "synthetic_gate_entropy": float(entropy.detach().cpu()),
-        "synthetic_agent_update_active": float(update_quality_agent),
-    }
+    step_logs["synthetic_real_diagnostics_skipped"] = float(skip_real_diagnostics)
+    return step_logs
 
 
 def _average_logs(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -1563,54 +1397,50 @@ def calibrate_quality_agent_on_real(
         feedback_history,
         cluster_model=cluster_model,
     )
+
+
+    cluster_count = len(training_feedback["per_cluster_metrics"])
+    feedback_table = _feedback_for_clusters(training_feedback, np.arange(cluster_count))
+
+    def feedback_rows(cluster_ids):
+        ids = np.clip(np.asarray(cluster_ids, dtype=np.int64).reshape(-1), 0, cluster_count - 1)
+        return {key: feedback_table[key][ids] for key in ("features", "target")}
+
     quality_agent.train()
-    losses: list[float] = []
-    reward_losses: list[float] = []
-    mean_regularizers: list[float] = []
-    entropies: list[float] = []
+    agent_parameters = tuple(quality_agent.parameters())
+    batch_logs: list[dict[str, float]] = []
     for batch in data_bundle.train_loader:
         x, y = batch[0].to(device), batch[1].to(device)
         cluster_ids = cluster_model.predict_tensor(x).numpy()
-        feedback = build_paper_cbtg_feedback(
-            np.asarray(training_feedback["overall_metrics"], dtype=np.float64),
-            np.asarray(training_feedback["run_std"], dtype=np.float64),
-            np.asarray(training_feedback["per_cluster_metrics"], dtype=np.float64),
-            cluster_ids,
-        )
+        feedback = feedback_rows(cluster_ids)
         features = torch.tensor(feedback["features"], dtype=x.dtype, device=device)
         reward = torch.tensor(feedback["target"], dtype=y.dtype, device=device)
         confidence = quality_agent(x, y, features).reshape(-1)
         loss, parts = paper_cbtg_agent_loss(confidence, reward)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(quality_agent.parameters(), config.GRAD_CLIP_NORM)
+        torch.nn.utils.clip_grad_norm_(agent_parameters, config.GRAD_CLIP_NORM, foreach=True)
         optimizer.step()
-        losses.append(float(loss.detach().cpu()))
-        reward_losses.append(float(parts["expected_reward_loss"].detach().cpu()))
-        mean_regularizers.append(float(parts["mean_regularizer"].detach().cpu()))
-        entropies.append(float(parts["confidence_entropy"].detach().cpu()))
-    if not losses:
+        batch_logs.append(scalar_logs({
+            "real_cbtg_agent_loss": loss,
+            "real_cbtg_expected_reward_loss": parts["expected_reward_loss"],
+            "real_cbtg_mean_regularizer": parts["mean_regularizer"],
+            "real_cbtg_confidence_entropy": parts["confidence_entropy"],
+        }))
+    if not batch_logs:
         raise ValueError("CBTG-Agent requires a non-empty real training loader.")
     quality_agent.eval()
 
     def real_batch_weights(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         cluster_ids = cluster_model.predict_tensor(x).numpy()
-        feedback = build_paper_cbtg_feedback(
-            np.asarray(training_feedback["overall_metrics"], dtype=np.float64),
-            np.asarray(training_feedback["run_std"], dtype=np.float64),
-            np.asarray(training_feedback["per_cluster_metrics"], dtype=np.float64),
-            cluster_ids,
-        )
+        feedback = feedback_rows(cluster_ids)
         features = torch.tensor(feedback["features"], dtype=x.dtype, device=x.device)
         with torch.no_grad():
             return quality_agent(x, y, features).reshape(-1, 1).detach()
 
     logs = {
         "real_cbtg_agent_epoch": float(epoch),
-        "real_cbtg_agent_loss": float(np.mean(losses)),
-        "real_cbtg_expected_reward_loss": float(np.mean(reward_losses)),
-        "real_cbtg_mean_regularizer": float(np.mean(mean_regularizers)),
-        "real_cbtg_confidence_entropy": float(np.mean(entropies)),
+        **{key: float(np.mean([row[key] for row in batch_logs])) for key in batch_logs[0]},
         "real_cbtg_training_rmse": float(training_feedback["training_rmse"]),
         "real_cbtg_training_mae": float(training_feedback["training_mae"]),
         "real_cbtg_training_mape": float(training_feedback["training_mape"]),
@@ -1627,6 +1457,9 @@ def build_synthetic_pretrain_optimizer(
     agent_lr = float(getattr(config, "SYNTHETIC_AGENT_LR", pretrain_lr))
     if not np.isclose(agent_lr, pretrain_lr, rtol=0.0, atol=1.0e-12):
         raise ValueError("Synthetic model and CBTG-Agent must use the same pretraining learning rate.")
+    fused = bool(getattr(config, "FAST_FUSED_PRETRAIN_OPTIMIZER", False))
+    if fused and any(p.device.type != "cuda" for m in (model, quality_agent) for p in m.parameters()):
+        raise ValueError("Fused pretraining optimizer requires all parameters on CUDA.")
     return AdamW(
         [
             {"params": model.parameters(), "name": "synthetic_model"},
@@ -1634,6 +1467,7 @@ def build_synthetic_pretrain_optimizer(
         ],
         lr=pretrain_lr,
         weight_decay=config.WEIGHT_DECAY,
+        **({"fused": True} if fused else {}),
     )
 
 
@@ -1665,6 +1499,7 @@ def dynamic_synthetic_refresh_due(
     return current > warmup and (current - warmup - 1) % refresh == 0
 
 
+@compiled_pretraining
 def pretrain_with_cbtg(
     model: torch.nn.Module,
     quality_agent: SyntheticQualityAgent,
@@ -1681,6 +1516,8 @@ def pretrain_with_cbtg(
     if agent_epochs < 1:
         raise ValueError("SYNTHETIC_AGENT_EPOCHS must be positive.")
     optimizer = build_synthetic_pretrain_optimizer(model, quality_agent)
+
+    clip_parameters = (tuple(model.parameters()), tuple(quality_agent.parameters()))
     refresh_epochs = int(getattr(config, "DYNAMIC_SYNTHETIC_REFRESH_EPOCHS", 5))
     warmup_epochs = int(getattr(config, "DYNAMIC_SYNTHETIC_WARMUP_EPOCHS", 0))
     dynamic_synthetic_refresh_due(1, refresh_epochs, warmup_epochs)
@@ -1742,6 +1579,7 @@ def pretrain_with_cbtg(
                     device,
                     dynamic_state=dynamic_state,
                     update_quality_agent=update_quality_agent,
+                    clip_parameters=clip_parameters,
                 )
             )
         avg_logs = _average_logs(batch_logs)
@@ -1876,11 +1714,12 @@ def run_cbtg_pretraining(
             freeze_backbone=bool(getattr(config, "FREEZE_FINETUNE_BACKBONE", False)),
             quality_agent=quality_agent,
             quality_agent_calibration_fn=real_agent_calibrator,
+            cluster_model=cluster_model,
         )
         ckpt_path = config.CHECKPOINT_DIR / "best_model.pth"
         if ckpt_path.exists():
-            load_checkpoint(model, ckpt_path, device)
             checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+            restore_model_checkpoint(model, checkpoint, device)
             agent_state = checkpoint.get("synthetic_quality_agent_state_dict")
             if agent_state is None:
                 raise RuntimeError("Best checkpoint is missing the calibrated CBTG-Agent state.")

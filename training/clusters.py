@@ -1,15 +1,14 @@
-"""Cluster working conditions for the CBTG reward."""
-
 from __future__ import annotations
 
 import numpy as np
 import torch
 
 import config
+from utils.tensor_logging import scalar_logs
 
 
 class WorkingConditionCluster:
-    """Cluster CAPL samples into working-condition groups."""
+
 
     def __init__(
         self,
@@ -44,7 +43,7 @@ class WorkingConditionCluster:
         x_train: np.ndarray,
         y_train: np.ndarray | None = None,
     ) -> "WorkingConditionCluster":
-        """Fit on standardized training inputs and order C1--C5 by mean YS."""
+
         from sklearn.cluster import KMeans
 
         x = np.asarray(x_train, dtype=np.float32)
@@ -78,7 +77,7 @@ class WorkingConditionCluster:
         return self
 
     def predict(self, x: np.ndarray) -> np.ndarray:
-        """Predict cluster ids for an array of samples (numpy in, int64 out)."""
+
         if not self._is_fitted or self._kmeans is None:
             raise RuntimeError(
                 "WorkingConditionCluster.fit() must be called before predict()."
@@ -94,7 +93,7 @@ class WorkingConditionCluster:
         return labels
 
     def predict_tensor(self, x: torch.Tensor) -> torch.Tensor:
-        """Predict cluster ids for a batch tensor; returns a CPU long tensor."""
+
         labels_np = self.predict(x.detach().cpu().numpy())
         return torch.from_numpy(labels_np).long()
 
@@ -111,15 +110,12 @@ def compute_cluster_balance_stats(
     cluster_labels: torch.Tensor,
     num_clusters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
-    """Compute per-cluster metrics and variances."""
+
     y_pred_flat = y_pred.reshape(-1)
     y_true_flat = y_true.reshape(-1)
     labels = cluster_labels.reshape(-1).to(device=y_pred.device)
 
-    cluster_rmse: list[torch.Tensor] = []
-    cluster_mae: list[torch.Tensor] = []
-    cluster_mape: list[torch.Tensor] = []
-    cluster_r2: list[torch.Tensor] = []
+    cluster_values = {name: [] for name in ("rmse", "mae", "mape", "r2")}
     details: dict[str, object] = {}
     eps = y_pred.new_tensor(1.0e-6)
 
@@ -131,10 +127,12 @@ def compute_cluster_balance_stats(
         yt = y_true_flat[mask]
         residuals = yp - yt
 
-        rmse_g = residuals.pow(2).mean().clamp_min(1.0e-12).sqrt()
-        mae_g = residuals.abs().mean()
-        mape_g = (residuals.abs() / yt.abs().clamp_min(eps)).mean() * 100.0
-        ss_res = residuals.pow(2).sum()
+        squared_error = residuals.pow(2)
+        absolute_error = residuals.abs()
+        rmse_g = squared_error.mean().clamp_min(1.0e-12).sqrt()
+        mae_g = absolute_error.mean()
+        mape_g = (absolute_error / yt.abs().clamp_min(eps)).mean() * 100.0
+        ss_res = squared_error.sum()
         ss_tot = (yt - yt.mean()).pow(2).sum().clamp_min(1.0e-12)
         r2_g = 1.0 - ss_res / ss_tot
         r2_g = r2_g.clamp(
@@ -142,43 +140,24 @@ def compute_cluster_balance_stats(
             max=float(getattr(config, "CLUSTER_BALANCE_R2_MAX", 1.0)),
         )
 
-        cluster_rmse.append(rmse_g)
-        cluster_mae.append(mae_g)
-        cluster_mape.append(mape_g)
-        cluster_r2.append(r2_g)
-        details[f"cluster_{g}_rmse"] = float(rmse_g.detach().cpu())
-        details[f"cluster_{g}_mae"] = float(mae_g.detach().cpu())
-        details[f"cluster_{g}_mape"] = float(mape_g.detach().cpu())
-        details[f"cluster_{g}_r2"] = float(r2_g.detach().cpu())
+        for name, value in zip(cluster_values, (rmse_g, mae_g, mape_g, r2_g)):
+            cluster_values[name].append(value)
+            details[f"cluster_{g}_{name}"] = value.detach()
 
-    if not cluster_rmse:
+    active_count = len(cluster_values["rmse"])
+    if not active_count:
         zero = y_pred.new_tensor(0.0)
         return zero, zero, details
 
-    def _var(tensors: list[torch.Tensor]) -> torch.Tensor:
-        stack = torch.stack(tensors)
-        return ((stack - stack.mean()) ** 2).mean()
-
-    rmse_stack = torch.stack(cluster_rmse)
-    rmse_mean = rmse_stack.mean()
-    var_rmse = _var(cluster_rmse)
-    var_mae = _var(cluster_mae)
-    var_mape = _var(cluster_mape)
-    var_r2 = _var(cluster_r2)
-
-    details["cluster_rmse_mean"] = float(rmse_mean.detach().cpu())
-    details["cluster_mae_mean"] = float(torch.stack(cluster_mae).mean().detach().cpu())
-    details["cluster_mape_mean"] = float(torch.stack(cluster_mape).mean().detach().cpu())
-    details["cluster_r2_mean"] = float(torch.stack(cluster_r2).mean().detach().cpu())
-    details["cluster_rmse_var"] = float(var_rmse.detach().cpu())
-    details["cluster_mae_var"] = float(var_mae.detach().cpu())
-    details["cluster_mape_var"] = float(var_mape.detach().cpu())
-    details["cluster_r2_var"] = float(var_r2.detach().cpu())
-    details["cluster_active_count"] = len(cluster_rmse)
-    details["var_mae_tensor"] = var_mae.detach()
-    details["var_mape_tensor"] = var_mape.detach()
-    details["var_r2_tensor"] = var_r2.detach()
-    return rmse_mean.detach(), var_rmse.detach(), details
+    stacks = {name: torch.stack(values) for name, values in cluster_values.items()}
+    means = {name: values.mean() for name, values in stacks.items()}
+    variances = {name: ((values - means[name]) ** 2).mean() for name, values in stacks.items()}
+    details.update({f"cluster_{name}_mean": value for name, value in means.items()})
+    details.update({f"cluster_{name}_var": value for name, value in variances.items()})
+    details = scalar_logs(details)
+    details["cluster_active_count"] = active_count
+    details.update({f"var_{name}_tensor": variances[name].detach() for name in ("mae", "mape", "r2")})
+    return means["rmse"].detach(), variances["rmse"].detach(), details
 
 
 def compute_cluster_balance_stats_numpy(
@@ -187,7 +166,7 @@ def compute_cluster_balance_stats_numpy(
     cluster_labels: np.ndarray,
     num_clusters: int,
 ) -> tuple[float, float, np.ndarray, dict[str, object]]:
-    """Compute NumPy per-cluster metrics and variances."""
+
     y_pred_flat = np.asarray(y_pred, dtype=np.float64).reshape(-1)
     y_true_flat = np.asarray(y_true, dtype=np.float64).reshape(-1)
     labels = np.asarray(cluster_labels, dtype=np.int64).reshape(-1)
@@ -267,7 +246,7 @@ def cluster_balance_reward(
     var_mape: float = 0.0,
     var_r2: float = 0.0,
 ) -> float:
-    """Compute the cluster-balance Agent reward."""
+
     lam = float(
         lambda_cluster
         if lambda_cluster is not None
@@ -285,7 +264,7 @@ def cluster_difficulty_scores(
     per_cluster_rmse: np.ndarray,
     cluster_ids: np.ndarray,
 ) -> np.ndarray:
-    """Map cluster RMSE to per-sample difficulty."""
+
     arr = np.asarray(per_cluster_rmse, dtype=np.float64).reshape(-1)
     finite = arr[np.isfinite(arr)]
     global_mean = float(np.nanmean(finite)) if len(finite) else 1.0

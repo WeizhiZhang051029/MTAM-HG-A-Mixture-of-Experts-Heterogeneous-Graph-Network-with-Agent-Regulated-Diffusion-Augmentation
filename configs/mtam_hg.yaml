@@ -97,3 +97,18 @@ cli:
   confidence_mean_reg_lambda: 0.01
   confidence_entropy_reg_lambda: 0.001
   use_confidence_weighted_supervised_loss: false
+
+rgcn_vectorized: true
+fast_skip_redundant_real_forward: true
+fast_skip_refresh_diagnostics: true
+
+rgcn_basis_factorized: true
+
+fast_sdpa: false
+fast_cache_positional_encoding: true
+
+fast_compile_pretrain: true
+
+fast_fused_pretrain_optimizer: true
+
+feedback_eval_batch_size: 256

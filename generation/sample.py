@@ -1,5 +1,3 @@
-"""Run TabDiff sampling and collect the generated table."""
-
 from __future__ import annotations
 
 import argparse

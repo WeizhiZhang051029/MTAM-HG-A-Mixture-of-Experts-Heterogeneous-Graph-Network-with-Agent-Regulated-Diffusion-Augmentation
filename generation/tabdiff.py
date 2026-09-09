@@ -1,5 +1,3 @@
-"""Build and validate TabDiff commands and artifacts."""
-
 from __future__ import annotations
 
 import shutil
@@ -74,7 +72,7 @@ def base_exp_name() -> str:
 
 
 def generation_seed() -> int:
-    """Return the seed implemented by official TabDiff deterministic mode."""
+
     seed = int(getattr(config, "TABDIFF_GENERATION_SEED", TABDIFF_DETERMINISTIC_SEED))
     if seed != TABDIFF_DETERMINISTIC_SEED:
         raise ValueError(
@@ -263,7 +261,7 @@ def checkpoint_output_snapshot(
     name: str | None = None,
     experiment: str | None = None,
 ) -> dict[str, tuple[int, int, str]]:
-    """Capture existing official TabDiff checkpoint outputs."""
+
     checkpoint_dir = repo / "tabdiff" / "ckpt" / (name or dataname()) / (experiment or exp_name())
     snapshot: dict[str, tuple[int, int, str]] = {}
     if not checkpoint_dir.exists():
@@ -283,7 +281,7 @@ def find_fresh_checkpoint(
     previous_snapshot: dict[str, tuple[int, int, str]],
     experiment: str | None = None,
 ) -> Path:
-    """Return a checkpoint created or updated by the current train command."""
+
     current = checkpoint_output_snapshot(repo, name, experiment)
     changed = [Path(path) for path, signature in current.items() if previous_snapshot.get(path) != signature]
     if len(changed) != 1:
@@ -305,7 +303,7 @@ def _sample_candidates(repo: Path, name: str | None = None) -> list[Path]:
 
 
 def sample_output_snapshot(repo: Path, name: str | None = None) -> dict[str, tuple[int, int, str]]:
-    """Capture timestamp, size and content hash for existing sample outputs."""
+
     snapshot: dict[str, tuple[int, int, str]] = {}
     for path in _sample_candidates(repo, name):
         stat = path.stat()

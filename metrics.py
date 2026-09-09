@@ -1,5 +1,3 @@
-"""Evaluation metrics for yield strength prediction."""
-
 from __future__ import annotations
 
 import numpy as np
@@ -31,7 +29,7 @@ def tail_mae(
     upper_threshold: float | None = None,
     quantile: float = 0.10,
 ) -> float:
-    """MAE on bottom and top quantile samples by true yield strength."""
+
     y_flat = y_true.reshape(-1)
     pred_flat = y_pred.reshape(-1)
     lower = np.quantile(y_flat, quantile) if lower_threshold is None else lower_threshold
@@ -53,7 +51,7 @@ def uncertainty_reliability(
     b: np.ndarray,
     levels: tuple[float, ...] = (0.50, 0.80, 0.90),
 ) -> dict[str, float]:
-    """Empirical coverage for central Laplace prediction intervals."""
+
     out: dict[str, float] = {}
     abs_err = np.abs(y_true - mu)
     for level in levels:

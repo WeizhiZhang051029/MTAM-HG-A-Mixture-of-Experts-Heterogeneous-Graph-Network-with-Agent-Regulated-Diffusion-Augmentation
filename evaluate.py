@@ -1,5 +1,3 @@
-"""Evaluation and output export utilities."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,7 +8,24 @@ import torch
 
 import config
 from metrics import compute_metrics
+from losses import prediction_loss
 from utils.logger import save_json
+
+
+_SAMPLE_OUTPUT_FILES = {'expert_weights': 'mtam_hg_expert_weights.npy',
+ 'gate_probs': 'mtam_hg_gate_probs.npy',
+ 'topk_indices': 'mtam_hg_topk_indices.npy',
+ 'expert_preds': 'mtam_hg_expert_preds.npy',
+ 'sample_confidence': 'agent_sample_confidence.npy',
+ 'synthetic_keep_score': 'agent_synthetic_keep_score.npy',
+ 'training_weight': 'agent_training_weight.npy',
+ 'expert_reliability': 'agent_expert_reliability.npy',
+ 'uncertainty_reason_vector': 'agent_uncertainty_reason_vector.npy',
+ 'expert_uncertainty': 'agent_expert_uncertainty.npy',
+ 'agent_gate_entropy': 'agent_gate_entropy.npy'}
+_GRAPH_OUTPUT_FILES = {'A_kg': 'learned_A_kg.npy',
+ 'A_kg_experts': 'learned_A_kg_experts.npy',
+ 'A_het': 'learned_A_het.npy'}
 
 
 def _inverse_y(y: np.ndarray, data_bundle) -> np.ndarray:
@@ -45,7 +60,7 @@ def _safe_pearson(x: np.ndarray, y: np.ndarray) -> float:
 
 
 def agent_selection_alignment_metrics(diag: pd.DataFrame) -> dict[str, float | int]:
-    """Summarize whether Agent confidence aligns with real validation/test quality."""
+
     if diag.empty or "abs_error" not in diag or "sample_confidence" not in diag:
         return {}
     abs_error = diag["abs_error"].astype(float).to_numpy()
@@ -90,71 +105,47 @@ def agent_selection_alignment_metrics(diag: pd.DataFrame) -> dict[str, float | i
 
 
 @torch.no_grad()
-def collect_predictions(model, loader, device: torch.device, data_bundle) -> dict[str, np.ndarray]:
+def collect_predictions(model, loader, device: torch.device, data_bundle, *, batch_observer=None) -> dict[str, np.ndarray]:
     model.eval()
     ys, mus, bs = [], [], []
     gates_by_stage: list[list[np.ndarray]] | None = None
-    last_A_kg = None
-    last_A_kg_experts = None
-    last_A_het = None
-    expert_weights_all = []
-    gate_probs_all = []
-    topk_indices_all = []
-    expert_preds_all = []
-    sample_confidence_all = []
-    synthetic_keep_score_all = []
-    training_weight_all = []
-    expert_reliability_all = []
-    uncertainty_reason_all = []
-    expert_uncertainty_all = []
-    agent_gate_entropy_all = []
+    sample_chunks = {key: [] for key in _SAMPLE_OUTPUT_FILES}
+    last_graphs = {key: None for key in _GRAPH_OUTPUT_FILES}
 
     for batch in loader:
         x, y = batch[0], batch[1]
         x = x.to(device)
         y = y.to(device)
-        outputs = _as_output_dict(model(x))
+        raw_outputs = model(x)
+        if batch_observer is not None:
+            batch_observer(raw_outputs, y)
+        outputs = _as_output_dict(raw_outputs)
         ys.append(y.cpu().numpy())
         mus.append(outputs["mu"].cpu().numpy())
         if "b" in outputs:
             bs.append(outputs["b"].cpu().numpy())
+        sample_arrays = {
+            key: outputs[key].detach().cpu().numpy()
+            for key in sample_chunks if key in outputs
+        }
         if outputs.get("gate_weights"):
             if gates_by_stage is None:
                 gates_by_stage = [[] for _ in outputs["gate_weights"]]
+            arrays_by_id = {id(outputs[key]): array for key, array in sample_arrays.items()}
             for stage_idx, weights in enumerate(outputs["gate_weights"]):
-                gates_by_stage[stage_idx].append(weights.cpu().numpy())
-        elif "expert_weights" in outputs:
+                array = arrays_by_id.get(id(weights))
+                if array is None or weights.requires_grad:
+                    array = weights.cpu().numpy()
+                gates_by_stage[stage_idx].append(array)
+        elif "expert_weights" in sample_arrays:
             if gates_by_stage is None:
                 gates_by_stage = [[]]
-            gates_by_stage[0].append(outputs["expert_weights"].detach().cpu().numpy())
-        if "expert_weights" in outputs:
-            expert_weights_all.append(outputs["expert_weights"].detach().cpu().numpy())
-        if "gate_probs" in outputs:
-            gate_probs_all.append(outputs["gate_probs"].detach().cpu().numpy())
-        if "topk_indices" in outputs:
-            topk_indices_all.append(outputs["topk_indices"].detach().cpu().numpy())
-        if "expert_preds" in outputs:
-            expert_preds_all.append(outputs["expert_preds"].detach().cpu().numpy())
-        if "sample_confidence" in outputs:
-            sample_confidence_all.append(outputs["sample_confidence"].detach().cpu().numpy())
-        if "synthetic_keep_score" in outputs:
-            synthetic_keep_score_all.append(outputs["synthetic_keep_score"].detach().cpu().numpy())
-        if "training_weight" in outputs:
-            training_weight_all.append(outputs["training_weight"].detach().cpu().numpy())
-        if "expert_reliability" in outputs:
-            expert_reliability_all.append(outputs["expert_reliability"].detach().cpu().numpy())
-        if "uncertainty_reason_vector" in outputs:
-            uncertainty_reason_all.append(outputs["uncertainty_reason_vector"].detach().cpu().numpy())
-        if "expert_uncertainty" in outputs:
-            expert_uncertainty_all.append(outputs["expert_uncertainty"].detach().cpu().numpy())
-        if "agent_gate_entropy" in outputs:
-            agent_gate_entropy_all.append(outputs["agent_gate_entropy"].detach().cpu().numpy())
-        if "A_kg" in outputs:
-            last_A_kg = outputs["A_kg"].detach().cpu().numpy()
-        if "A_kg_experts" in outputs:
-            last_A_kg_experts = outputs["A_kg_experts"].detach().cpu().numpy()
-        if "A_het" in outputs:
-            last_A_het = outputs["A_het"].detach().cpu().numpy()
+            gates_by_stage[0].append(sample_arrays["expert_weights"])
+        for key, array in sample_arrays.items():
+            sample_chunks[key].append(array)
+        for key in last_graphs:
+            if key in outputs:
+                last_graphs[key] = outputs[key].detach().cpu().numpy()
 
     y = np.concatenate(ys, axis=0)
     mu = np.concatenate(mus, axis=0)
@@ -165,44 +156,21 @@ def collect_predictions(model, loader, device: torch.device, data_bundle) -> dic
         "y": _inverse_y(y, data_bundle),
         "mu": _inverse_y(mu, data_bundle),
     }
-    if last_A_kg is not None:
-        result["A_kg"] = last_A_kg
-    if last_A_kg_experts is not None:
-        result["A_kg_experts"] = last_A_kg_experts
-    if last_A_het is not None:
-        result["A_het"] = last_A_het
+    result.update({key: value for key, value in last_graphs.items() if value is not None})
     if b is not None:
         result["b_scaled"] = b
         result["b"] = _inverse_b(b, data_bundle)
     if gates_by_stage is not None:
         result["gate_weights"] = np.stack([np.concatenate(stage, axis=0) for stage in gates_by_stage], axis=0)
-    if expert_weights_all:
-        result["expert_weights"] = np.concatenate(expert_weights_all, axis=0)
-    if gate_probs_all:
-        result["gate_probs"] = np.concatenate(gate_probs_all, axis=0)
-    if topk_indices_all:
-        result["topk_indices"] = np.concatenate(topk_indices_all, axis=0)
-    if expert_preds_all:
-        result["expert_preds"] = np.concatenate(expert_preds_all, axis=0)
-    if sample_confidence_all:
-        result["sample_confidence"] = np.concatenate(sample_confidence_all, axis=0)
-    if synthetic_keep_score_all:
-        result["synthetic_keep_score"] = np.concatenate(synthetic_keep_score_all, axis=0)
-    if training_weight_all:
-        result["training_weight"] = np.concatenate(training_weight_all, axis=0)
-    if expert_reliability_all:
-        result["expert_reliability"] = np.concatenate(expert_reliability_all, axis=0)
-    if uncertainty_reason_all:
-        result["uncertainty_reason_vector"] = np.concatenate(uncertainty_reason_all, axis=0)
-    if expert_uncertainty_all:
-        result["expert_uncertainty"] = np.concatenate(expert_uncertainty_all, axis=0)
-    if agent_gate_entropy_all:
-        result["agent_gate_entropy"] = np.concatenate(agent_gate_entropy_all, axis=0)
+    result.update({
+        key: np.concatenate(chunks, axis=0)
+        for key, chunks in sample_chunks.items() if chunks
+    })
     return result
 
 
-def evaluate_model(model, loader, device: torch.device, data_bundle) -> tuple[dict[str, float], dict[str, np.ndarray]]:
-    collected = collect_predictions(model, loader, device, data_bundle)
+def evaluate_model(model, loader, device: torch.device, data_bundle, *, batch_observer=None) -> tuple[dict[str, float], dict[str, np.ndarray]]:
+    collected = collect_predictions(model, loader, device, data_bundle, batch_observer=batch_observer)
     b = collected.get("b")
     metrics = compute_metrics(
         collected["y"],
@@ -211,6 +179,23 @@ def evaluate_model(model, loader, device: torch.device, data_bundle) -> tuple[di
         tail_thresholds=data_bundle.tail_thresholds,
     )
     return metrics, collected
+
+
+def evaluate_model_and_loss(model, loader, device: torch.device, data_bundle):
+
+    loss_sum = 0.0
+    count = 0
+
+    def accumulate_loss(outputs, y):
+        nonlocal loss_sum, count
+        loss = prediction_loss(outputs, y, weights=None)
+        loss_sum += float(loss.detach().cpu()) * y.shape[0]
+        count += int(y.shape[0])
+
+    metrics, collected = evaluate_model(
+        model, loader, device, data_bundle, batch_observer=accumulate_loss,
+    )
+    return metrics, collected, loss_sum / max(count, 1)
 
 
 def save_evaluation_outputs(
@@ -232,42 +217,19 @@ def save_evaluation_outputs(
         pred_df["b"] = collected["b"].reshape(-1)
     pred_df.to_csv(output_dir / "predictions.csv", index=False, encoding="utf-8")
 
-    if "A_kg" in collected:
-        np.save(output_dir / "learned_A_kg.npy", collected["A_kg"])
-    if "A_kg_experts" in collected:
-        np.save(output_dir / "learned_A_kg_experts.npy", collected["A_kg_experts"])
-        edge_importance = np.abs(collected["A_kg_experts"]).mean(axis=0)
-        np.fill_diagonal(edge_importance, 0.0)
-        node_scores = edge_importance.sum(axis=0) + edge_importance.sum(axis=1)
-        node_importance = node_scores / max(float(node_scores.max()), 1.0e-12)
-        np.save(output_dir / "edge_importance.npy", edge_importance)
-        np.save(output_dir / "node_importance.npy", node_importance)
-    if "A_het" in collected:
-        np.save(output_dir / "learned_A_het.npy", collected["A_het"])
-    if "gate_weights" in collected:
-        np.save(output_dir / "gate_weights.npy", collected["gate_weights"])
-    if "expert_weights" in collected:
-        np.save(output_dir / "mtam_hg_expert_weights.npy", collected["expert_weights"])
-    if "gate_probs" in collected:
-        np.save(output_dir / "mtam_hg_gate_probs.npy", collected["gate_probs"])
-    if "topk_indices" in collected:
-        np.save(output_dir / "mtam_hg_topk_indices.npy", collected["topk_indices"])
-    if "expert_preds" in collected:
-        np.save(output_dir / "mtam_hg_expert_preds.npy", collected["expert_preds"])
-    if "sample_confidence" in collected:
-        np.save(output_dir / "agent_sample_confidence.npy", collected["sample_confidence"])
-    if "synthetic_keep_score" in collected:
-        np.save(output_dir / "agent_synthetic_keep_score.npy", collected["synthetic_keep_score"])
-    if "training_weight" in collected:
-        np.save(output_dir / "agent_training_weight.npy", collected["training_weight"])
-    if "expert_reliability" in collected:
-        np.save(output_dir / "agent_expert_reliability.npy", collected["expert_reliability"])
-    if "uncertainty_reason_vector" in collected:
-        np.save(output_dir / "agent_uncertainty_reason_vector.npy", collected["uncertainty_reason_vector"])
-    if "expert_uncertainty" in collected:
-        np.save(output_dir / "agent_expert_uncertainty.npy", collected["expert_uncertainty"])
-    if "agent_gate_entropy" in collected:
-        np.save(output_dir / "agent_gate_entropy.npy", collected["agent_gate_entropy"])
+    for key, filename in _GRAPH_OUTPUT_FILES.items():
+        if key in collected:
+            np.save(output_dir / filename, collected[key])
+        if key == "A_kg_experts" and key in collected:
+            edge_importance = np.abs(collected["A_kg_experts"]).mean(axis=0)
+            np.fill_diagonal(edge_importance, 0.0)
+            node_scores = edge_importance.sum(axis=0) + edge_importance.sum(axis=1)
+            node_importance = node_scores / max(float(node_scores.max()), 1.0e-12)
+            np.save(output_dir / "edge_importance.npy", edge_importance)
+            np.save(output_dir / "node_importance.npy", node_importance)
+    for key, filename in {"gate_weights": "gate_weights.npy", **_SAMPLE_OUTPUT_FILES}.items():
+        if key in collected:
+            np.save(output_dir / filename, collected[key])
     if all(key in collected for key in ("sample_confidence", "expert_uncertainty", "agent_gate_entropy", "topk_indices", "expert_weights", "expert_preds")):
         diag = pd.DataFrame(
             {
