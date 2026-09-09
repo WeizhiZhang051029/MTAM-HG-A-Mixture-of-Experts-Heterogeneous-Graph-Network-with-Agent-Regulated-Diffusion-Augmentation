@@ -131,7 +131,7 @@ Representative settings include:
 | Number of HG experts         | 4               |
 | Active experts               | Top-2           |
 | Synthetic pretraining        | 100 epochs      |
-| Real-domain calibration      | 50 epochs       |
+| Real-domain calibration      | Up to 50 epochs; early-stopping patience: 5 |
 | Optimizer                    | AdamW           |
 
 Detailed architecture, optimization, routing, Agent, and LoRA parameters are specified in the configuration file.
@@ -172,7 +172,7 @@ python -m pip install --upgrade pip
 pip install -e .
 ```
 
-A PyTorch build compatible with the local CUDA environment is recommended for full experiments.
+The default main experiment requires **Linux and an NVIDIA GPU with CUDA support**. Install a PyTorch build compatible with the CUDA environment. The environment-activation commands above are platform-specific examples; they do not imply that the default training configuration supports Windows or macOS.
 
 ---
 
@@ -201,12 +201,13 @@ The pipeline sequentially:
 7. selects the model according to validation performance;
 8. evaluates the final model on the held-out test set.
 
-### Validate the Repository without Private Data
+### Check the Experiment Configuration
 
 ```bash
-python -m pytest -q
 python run_experiment.py --dry_run
 ```
+
+This command checks the experiment arguments and prints the per-run commands without training the model.
 
 ---
 
@@ -312,16 +313,28 @@ Each independent run stores the corresponding:
 * training logs;
 * preprocessing and experiment metadata.
 
-The complete experiment additionally generates:
+With the default configuration, the main experiment outputs are organized as follows (representative files shown):
 
 ```text
-outputs/
-├── experiment_summary.json
-├── metrics_mean_std.csv
-├── predictions/
-├── routing_analysis/
-└── figures/
+outputs/mtam_hg/
+└── <experiment_timestamp>/
+    ├── experiment_summary.json
+    ├── seed_42/
+    │   └── <run_timestamp>/
+    │       ├── checkpoints/
+    │       │   └── best_model.pth
+    │       ├── logs/
+    │       │   └── train_log.csv
+    │       └── results/
+    │           ├── metrics.json
+    │           ├── predictions.csv
+    │           └── ...
+    ├── seed_43/
+    │   └── ...
+    └── ...
 ```
+
+Per-run results and the mean and sample standard deviation across runs are stored in `experiment_summary.json`; the summary statistics are available under its `aggregate` field.
 
 Generated checkpoints, synthetic samples, predictions, preprocessing statistics, and industrial data are excluded from version control.
 
@@ -355,10 +368,10 @@ This project builds upon **PyTorch**, **scikit-learn**, and the open-source **Ta
 
 We thank the open-source community for the tools and resources that support research in tabular diffusion modeling, heterogeneous graph learning, mixture-of-experts architectures, and parameter-efficient adaptation.
 
-Third-party licenses and attribution information are provided in:
+The original TabDiff copyright and license are provided in:
 
 ```text
-THIRD_PARTY_NOTICES.md
+third_party/TabDiff/LICENSE
 ```
 
 ---
