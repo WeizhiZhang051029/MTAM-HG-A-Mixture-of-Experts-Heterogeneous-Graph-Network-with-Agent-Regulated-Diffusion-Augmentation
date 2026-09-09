@@ -172,7 +172,7 @@ python -m pip install --upgrade pip
 pip install -e .
 ```
 
-The default main experiment requires **Linux and an NVIDIA GPU with CUDA support**. Install a PyTorch build compatible with the CUDA environment. The environment-activation commands above are platform-specific examples; they do not imply that the default training configuration supports Windows or macOS.
+The default main experiment requires **Linux and an NVIDIA GPU with CUDA support**. Install a PyTorch build compatible with the CUDA environment. The environment-activation commands above are platform-specific examples. They do not imply that the default training configuration supports Windows or macOS.
 
 ---
 
