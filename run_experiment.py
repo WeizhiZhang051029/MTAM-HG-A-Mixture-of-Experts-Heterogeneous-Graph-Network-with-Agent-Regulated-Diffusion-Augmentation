@@ -75,7 +75,6 @@ from protocol import (
     DEFAULT_WEIGHT_DECAY,
     MAIN_TRAIN_ARG_SPECS,
     MR_LORA_ARG_SPECS,
-    RUNNER_SUMMARY_NAME,
     SUPERVISED_MAIN_EXPERIMENT_NAME,
     SUPERVISED_MAIN_TRAIN_MODE,
 )
@@ -443,18 +442,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def run_experiments(args: argparse.Namespace) -> dict[str, object]:
+def run_experiments(args: argparse.Namespace) -> None:
     from datetime import datetime
-
-    import numpy as np
-
-    from config_loader import load_yaml_config
 
     root = (PROJECT_ROOT / args.output_root).resolve()
     root = root / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     count = int(args.tabdiff_num_samples or DEFAULT_TABDIFF_NUM_SAMPLES)
-    results = []
-    commands = []
     for seed in args.seeds:
         run_dir = root / f"seed_{seed}"
         synthetic = str((PROJECT_ROOT / seed_template_path(args.synthetic_data_path, seed)).resolve())
@@ -465,7 +458,6 @@ def run_experiments(args: argparse.Namespace) -> dict[str, object]:
             command.extend(["--tabdiff_gpu", str(args.tabdiff_gpu)])
         if args.skip_tabdiff_generation:
             command.append("--require_existing_synthetic")
-        commands.append(command)
         if args.dry_run:
             print(subprocess.list2cmdline(command))
             continue
@@ -478,27 +470,8 @@ def run_experiments(args: argparse.Namespace) -> dict[str, object]:
             raise RuntimeError("Run and split seeds do not match.")
         if not all(math.isfinite(float(metrics[m])) for m in PAPER_METRICS):
             raise RuntimeError(f"Non-finite evaluation metric for seed {seed}.")
-        results.append({"seed": seed, "metrics": metrics, "metrics_path": str(paths[0])})
-    summary = {
-        "protocol": "per_run_split",
-        "feedback_source": "real_training_set",
-        "config": load_yaml_config(PROJECT_ROOT / args.config),
-        "arguments": vars(args),
-        "commands": commands,
-        "runs": results,
-        "aggregate": {
-            metric: {
-                "mean": float(np.mean([run["metrics"][metric] for run in results])),
-                "std": float(np.std([run["metrics"][metric] for run in results], ddof=1)) if len(results) > 1 else None,
-            }
-            for metric in PAPER_METRICS
-        } if results else {},
-    }
     if not args.dry_run:
-        root.mkdir(parents=True, exist_ok=True)
-        (root / RUNNER_SUMMARY_NAME).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Results: {root}")
-    return summary
 
 
 def main() -> None:

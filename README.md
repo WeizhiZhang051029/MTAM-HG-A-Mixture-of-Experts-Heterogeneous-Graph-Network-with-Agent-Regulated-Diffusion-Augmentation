@@ -104,7 +104,7 @@ For each of **10 independent runs**, the data are stratified by yield strength a
 
 All preprocessing, clustering, and synthetic-data generation are fitted only on the corresponding real training set. CBTG-Agent uses training-set feedback, while validation is used for model selection and early stopping; the test set is reserved for final evaluation.
 
-Results are reported as **mean ± standard deviation**. Statistical significance is assessed using a **two-sided paired Wilcoxon signed-rank test with Holm correction** (adjusted p < 0.05).
+Evaluation metrics and prediction results are saved separately for each run.
 
 ---
 
@@ -282,7 +282,7 @@ MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Di
 The main components are organized as follows:
 
 - `configs/mtam_hg.yaml`: configuration for the main MTAM-HG experiment.
-- `run_experiment.py`: experiment execution and aggregation of results across runs.
+- `run_experiment.py`: experiment execution with separate outputs for each run.
 - `generation/`: MP-TabDiff data preparation, training, sampling, and mechanism-based postprocessing.
 - `models/`: heterogeneous graph construction, IPOHGN experts, mixture-of-experts routing, and MR-LoRA adaptation.
 - `training/`: CBTG-Agent regulation, working-condition clustering, synthetic pretraining, and supporting training routines.
@@ -318,7 +318,6 @@ With the default configuration, the main experiment outputs are organized as fol
 ```text
 outputs/mtam_hg/
 └── <experiment_timestamp>/
-    ├── experiment_summary.json
     ├── seed_42/
     │   └── <run_timestamp>/
     │       ├── checkpoints/
@@ -334,7 +333,7 @@ outputs/mtam_hg/
     └── ...
 ```
 
-Per-run results and the mean and sample standard deviation across runs are stored in `experiment_summary.json`; the summary statistics are available under its `aggregate` field.
+Each run saves its own metrics, predictions, checkpoints, and logs. Cross-run summaries and statistical comparisons are left to the user.
 
 Generated checkpoints, synthetic samples, predictions, preprocessing statistics, and industrial data are excluded from version control.
 
