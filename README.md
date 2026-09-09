@@ -42,7 +42,7 @@ The MTAM-HG framework comprises two main modules:
 * **Data augmentation:** MP-TabDiff embeds furnace-temperature trajectories, production-window constraints, and an empirical yield-strength prior into tabular diffusion to generate process-consistent samples. CBTG-Agent dynamically perceives operating conditions and training states, and regulates synthetic samples through iterative decision-making, feedback, selection, and reweighting.
 
 * **MoE-IPOHGN prediction:** MoE-IPOHGN represents CAPL variables within an implicit process-order heterogeneous graph and captures condition-dependent variable interactions. A Hard Sparse Gate (HSG) adaptively activates specialized experts for different operating conditions, enabling sample-dependent yield-strength prediction.
-* 
+  
 Experiments on real CAPL production data demonstrate that MTAM-HG improves prediction accuracy and cross-condition stability over competitive baselines, while maintaining reliable performance under data scarcity.
 
 ---
