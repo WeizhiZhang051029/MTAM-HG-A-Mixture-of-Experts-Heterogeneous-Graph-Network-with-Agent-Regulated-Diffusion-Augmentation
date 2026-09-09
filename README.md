@@ -214,12 +214,10 @@ python run_experiment.py --dry_run
 
 ```text
 MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Diffusion-Augmentation/
-├── .github/
-│   └── workflows/
-│       └── ci.yml
 ├── configs/
 │   └── mtam_hg.yaml
 ├── generation/
+│   ├── __init__.py
 │   ├── prepare.py
 │   ├── train.py
 │   ├── sample.py
@@ -231,14 +229,11 @@ MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Di
 │   ├── cbtg-agent.jpg
 │   └── moe-ipohgn.jpg
 ├── models/
+│   ├── __init__.py
 │   ├── graph_structure.py
 │   ├── ipohgn.py
 │   ├── mr_lora.py
 │   └── mtam_hg.py
-├── scripts/
-│   └── audit_release.py
-├── tests/
-│   └── test_*.py
 ├── third_party/
 │   └── TabDiff/
 │       ├── LICENSE
@@ -249,16 +244,24 @@ MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Di
 │       ├── src/
 │       └── tabdiff/
 ├── training/
+│   ├── __init__.py
+│   ├── batch_metadata.py
 │   ├── cbtg.py
-│   └── clusters.py
+│   ├── clusters.py
+│   ├── compilation.py
+│   ├── evaluation.py
+│   ├── quality_agent.py
+│   ├── step_logging.py
+│   └── synthetic_types.py
 ├── utils/
+│   ├── __init__.py
 │   ├── graph.py
 │   ├── logger.py
-│   └── seed.py
+│   ├── seed.py
+│   └── tensor_logging.py
 ├── .gitattributes
 ├── .gitignore
 ├── CITATION.cff
-├── THIRD_PARTY_NOTICES.md
 ├── config.py
 ├── config_loader.py
 ├── dataset.py
@@ -277,17 +280,18 @@ MTAM-HG-A-Mixture-of-Experts-Heterogeneous-Graph-Network-with-Agent-Regulated-Di
 
 The main components are organized as follows:
 
-- `run_experiment.py`: main experiment runner with configurable seeds and result aggregation
-- `generation/`: MP-TabDiff training and synthetic-sample generation for each training partition
-- `models/`: heterogeneous graph experts, sparse routing, and MR-LoRA adaptation
-- `training/`: CBTG-Agent regulation, synthetic pretraining, and real-domain calibration
-- `protocol.py`: default experiment settings
-- `protocol_integrity.py`: data-partition and synthetic-data provenance checks
-- `pipeline.py`, `train.py`, and `evaluate.py`: workflow orchestration, training, and evaluation
-- `tests/`: implementation, reproducibility, and optional end-to-end checks
-- `third_party/TabDiff/`: adapted TabDiff implementation and its original license
-- `scripts/audit_release.py`: checks for private data, model artifacts, and credential indicators in release files
-
+- `configs/mtam_hg.yaml`: configuration for the main MTAM-HG experiment.
+- `run_experiment.py`: experiment execution and aggregation of results across runs.
+- `generation/`: MP-TabDiff data preparation, training, sampling, and mechanism-based postprocessing.
+- `models/`: heterogeneous graph construction, IPOHGN experts, mixture-of-experts routing, and MR-LoRA adaptation.
+- `training/`: CBTG-Agent regulation, working-condition clustering, synthetic pretraining, and supporting training routines.
+- `dataset.py`: data loading, partitioning, and preprocessing.
+- `pipeline.py`, `train.py`, and `evaluate.py`: workflow orchestration, model training, and prediction evaluation.
+- `config.py`, `config_loader.py`, and `protocol.py`: model settings, configuration loading, and experiment defaults.
+- `losses.py` and `metrics.py`: training objectives and regression evaluation metrics.
+- `protocol_integrity.py`: data-partition and synthetic-data provenance validation.
+- `utils/`: graph utilities, random-seed initialization, and logging.
+- `third_party/TabDiff/`: adapted TabDiff implementation with its original license.
 ---
 
 ## 📦 Outputs
