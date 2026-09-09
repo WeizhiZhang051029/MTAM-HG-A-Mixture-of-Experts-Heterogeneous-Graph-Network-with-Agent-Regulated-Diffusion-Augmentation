@@ -104,7 +104,7 @@ For each of **10 independent runs**, the data are stratified by yield strength a
 
 All preprocessing, clustering, and synthetic-data generation are fitted only on the corresponding real training set. CBTG-Agent uses training-set feedback, while validation is used for model selection and early stopping; the test set is reserved for final evaluation.
 
-Results are reported as **mean ± standard deviation**. Statistical significance is assessed using a **two-sided paired Wilcoxon signed-rank test with Holm correction** (\(p_{\mathrm{adj}}<0.05\)).
+Results are reported as **mean ± standard deviation**. Statistical significance is assessed using a **two-sided paired Wilcoxon signed-rank test with Holm correction** (adjusted p < 0.05).
 
 ---
 
