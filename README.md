@@ -333,10 +333,6 @@ outputs/mtam_hg/
     └── ...
 ```
 
-Each run saves its own metrics, predictions, checkpoints, and logs. Cross-run summaries and statistical comparisons are left to the user.
-
-Generated checkpoints, synthetic samples, predictions, preprocessing statistics, and industrial data are excluded from version control.
-
 ---
 
 ## 📏 Evaluation Metrics
