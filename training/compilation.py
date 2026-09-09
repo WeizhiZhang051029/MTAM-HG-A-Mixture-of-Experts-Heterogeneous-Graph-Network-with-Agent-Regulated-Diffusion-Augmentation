@@ -36,15 +36,15 @@ def configure_compile_cache() -> None:
 def compiled_pretraining(function):
     @wraps(function)
     def run(*args, **kwargs):
-        if not getattr(config, "FAST_COMPILE_PRETRAIN", False):
+        if not getattr(config, "COMPILE_PRETRAIN", False):
             return function(*args, **kwargs)
         bound = inspect.signature(function).bind(*args, **kwargs)
         model = bound.arguments["model"]
         device = torch.device(bound.arguments["device"])
         if device.type != "cuda":
-            raise ValueError("Compiled pretraining profile requires CUDA.")
-        if not getattr(config, "FAST_SKIP_REDUNDANT_REAL_FORWARD", False):
-            raise ValueError("Compile profile requires redundant-real-forward skipping.")
+            raise ValueError("Pretraining compilation requires CUDA.")
+        if not getattr(config, "SKIP_REDUNDANT_REAL_FORWARD", False):
+            raise ValueError("Pretraining compilation requires skip_redundant_real_forward=true.")
         configure_compile_cache()
         batch_size = int(getattr(config, "SYNTHETIC_BATCH_SIZE", config.BATCH_SIZE))
         example = bound.arguments["train_tensors"].x[:batch_size].to(device)

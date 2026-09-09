@@ -55,9 +55,9 @@ def append_run_timestamp_to_output_dir() -> None:
 
 
 _YAML_CONFIG_MAPPING = {key: key.upper() for key in """
-    rgcn_vectorized rgcn_basis_factorized fast_sdpa fast_compile_pretrain
-    feedback_eval_batch_size fast_fused_pretrain_optimizer fast_cache_positional_encoding
-    fast_skip_redundant_real_forward fast_skip_refresh_diagnostics data_path batch_size
+    rgcn_vectorized rgcn_basis_factorized use_sdpa compile_pretrain
+    feedback_eval_batch_size fused_pretrain_optimizer cache_positional_encoding
+    skip_redundant_real_forward skip_refresh_diagnostics data_path batch_size
     epochs lr weight_decay dropout seed split_seed split_method generation_seed
     graph_backbone_layers top_k lambda_moe moe_aux_lambda moe_gate_temperature
     moe_balance_prob_lambda moe_balance_usage_lambda moe_entropy_reg_lambda

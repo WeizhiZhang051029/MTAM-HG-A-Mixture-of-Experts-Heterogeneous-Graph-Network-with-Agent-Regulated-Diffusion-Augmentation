@@ -977,7 +977,7 @@ def _refresh_diagnostic_errors(model, train_tensors, synthetic_bundle, eval_load
     synthetic_mse = np.zeros(n, dtype=np.float64)
     train_region_mse = np.zeros(n, dtype=np.float64)
 
-    if not getattr(config, "FAST_SKIP_REFRESH_DIAGNOSTICS", False):
+    if not getattr(config, "SKIP_REFRESH_DIAGNOSTICS", False):
         with torch.no_grad():
             for x, y, sample_ids in eval_loader:
                 x = x.to(device)
@@ -1167,7 +1167,7 @@ def refresh_dynamic_synthetic_weights(
     if agent_was_training:
         quality_agent.train()
     return {
-        "dynamic_refresh_diagnostics_skipped": float(getattr(config, "FAST_SKIP_REFRESH_DIAGNOSTICS", False)),
+        "dynamic_refresh_diagnostics_skipped": float(getattr(config, "SKIP_REFRESH_DIAGNOSTICS", False)),
         "dynamic_refresh_epoch": float(epoch),
         "dynamic_refresh_count": float(dynamic_state.refresh_count),
         "dynamic_weight_mean": float(np.mean(dynamic_state.weights)) if n else float("nan"),
@@ -1288,7 +1288,7 @@ def _synthetic_step(
 
     skip_real_diagnostics = (
         feedback_reward is not None
-        and getattr(config, "FAST_SKIP_REDUNDANT_REAL_FORWARD", False)
+        and getattr(config, "SKIP_REDUNDANT_REAL_FORWARD", False)
     )
     if skip_real_diagnostics:
         mse_real = y.new_full((y.shape[0],), float("nan"))
@@ -1457,7 +1457,7 @@ def build_synthetic_pretrain_optimizer(
     agent_lr = float(getattr(config, "SYNTHETIC_AGENT_LR", pretrain_lr))
     if not np.isclose(agent_lr, pretrain_lr, rtol=0.0, atol=1.0e-12):
         raise ValueError("Synthetic model and CBTG-Agent must use the same pretraining learning rate.")
-    fused = bool(getattr(config, "FAST_FUSED_PRETRAIN_OPTIMIZER", False))
+    fused = bool(getattr(config, "FUSED_PRETRAIN_OPTIMIZER", False))
     if fused and any(p.device.type != "cuda" for m in (model, quality_agent) for p in m.parameters()):
         raise ValueError("Fused pretraining optimizer requires all parameters on CUDA.")
     return AdamW(

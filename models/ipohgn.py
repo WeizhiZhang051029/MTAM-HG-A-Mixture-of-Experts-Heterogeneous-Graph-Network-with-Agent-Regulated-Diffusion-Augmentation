@@ -61,7 +61,7 @@ class ProcessOrderAttention(nn.Module):
         q = self.W_Q(x).view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.W_K(x).view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.W_V(x).view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
-        if getattr(config, "FAST_SDPA", False):
+        if getattr(config, "USE_SDPA", False):
             context = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         else:
             scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
@@ -92,7 +92,7 @@ class ProcessOrderTransformer(nn.Module):
         if x.ndim != 3:
             raise ValueError(f"Process-order transformer expects [B, N, D], got {tuple(x.shape)}.")
         _, sequence_length, d_model = x.shape
-        if getattr(config, "FAST_CACHE_POSITIONAL_ENCODING", False):
+        if getattr(config, "CACHE_POSITIONAL_ENCODING", False):
             key = (sequence_length, d_model, x.device, x.dtype)
             if self._position_cache_key != key:
                 self._position_cache = _sinusoid_encoding_table(
